@@ -5,6 +5,7 @@
 //! Video and controls each run on a thread of their own, so a camera that
 //! stops answering can't hold up the window.
 
+use crate::overlay::{self, Item, Metering};
 use eframe::egui::{self, RichText};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -604,6 +605,24 @@ fn value_width(ui: &egui::Ui, d: &Def, v: &Value) -> f32 {
     (text(v.min).max(text(v.max)) + 2.0 * ui.spacing().button_padding.x + 2.0).max(ui.spacing().interact_size.x)
 }
 
+/// Which overlays show over the preview.
+#[derive(Default)]
+struct Overlays {
+    metering: bool,
+    clipping: bool,
+    histogram: bool,
+    grid: bool,
+}
+
+/// The frame on screen measured for the overlays, in the view it shows, and
+/// whether the clipping mask was made from it.
+struct Measured {
+    at: Instant,
+    view: overlay::View,
+    masked: bool,
+    m: overlay::Measure,
+}
+
 /// The frame on screen.
 struct Shown {
     jpeg: Vec<u8>,
@@ -634,6 +653,9 @@ pub struct Tuning {
     ctl_error: Option<String>,
     confirm_reset: bool,
     log: Vec<String>,
+    overlays: Overlays,
+    measured: Option<Measured>,
+    mask: Option<egui::TextureHandle>,
 }
 
 const RATES: [u32; 6] = [30, 25, 20, 15, 10, 5];
@@ -667,6 +689,9 @@ impl Tuning {
             ctl_error: None,
             confirm_reset: false,
             log: Vec::new(),
+            overlays: Overlays::default(),
+            measured: None,
+            mask: None,
         }
     }
 
@@ -770,6 +795,8 @@ impl Tuning {
         self.note.clear();
         self.shown = None;
         self.texture = None;
+        self.measured = None;
+        self.mask = None;
     }
 
     /// Transfer all active threads to the job so it can wait for their devices.
@@ -979,7 +1006,7 @@ impl Tuning {
         }
     }
 
-    /// The picture in `rect`, or why there is none.
+    /// The picture in `rect` with the overlays chosen, or why there is none.
     fn preview_ui(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let streaming = self.stream.as_ref().is_some_and(|c| c.size.is_some());
         let (Some(tex), Some(s)) = (&self.texture, &self.shown) else {
@@ -998,9 +1025,9 @@ impl Tuning {
             });
             return;
         };
-        let at = s.at;
+        let (image, at) = (s.image.clone(), s.at);
         // What is shown, and why it may be stale.
-        let [w, h] = s.image.size;
+        let [w, h] = image.size;
         let mut caption = format!("{w}×{h}");
         if streaming && at.elapsed() < Duration::from_secs(2) {
             caption += &format!("  ·  {:.0} fps  ·  {} KiB per frame", s.fps, s.jpeg.len().div_ceil(1024));
@@ -1013,11 +1040,129 @@ impl Tuning {
         }
         egui::Image::new((tex.id(), rect.size())).corner_radius(4.0).paint_at(ui, rect);
         let painter = ui.painter_at(rect);
+        self.overlays_ui(ui.ctx(), &painter, rect, &image, at);
+        // The pixel under the pointer, for checking colours.
+        if let Some(p) = ui.interact(rect, ui.scope_id().with("preview"), egui::Sense::hover()).hover_pos() {
+            let x = (((p.x - rect.left()) / rect.width() * w as f32) as usize).min(w - 1);
+            let y = (((p.y - rect.top()) / rect.height() * h as f32) as usize).min(h - 1);
+            let c = image.pixels[y * w + x];
+            caption += &format!("  ·  at {x}, {y}: R {} G {} B {}", c.r(), c.g(), c.b());
+        }
         let font = egui::FontId::proportional(12.0);
         let galley = painter.layout_no_wrap(caption, font, egui::Color32::WHITE);
         let at = rect.left_bottom() + egui::vec2(6.0, -6.0 - galley.size().y);
-        painter.rect_filled(egui::Rect::from_min_size(at, galley.size()).expand(4.0), 4.0, egui::Color32::from_black_alpha(150));
+        painter.rect_filled(egui::Rect::from_min_size(at, galley.size()).expand(4.0), 4.0, overlay::BACKDROP);
         painter.galley(at, galley, egui::Color32::WHITE);
+        self.overlay_menu(ui, rect);
+    }
+
+    /// A control's value, if the camera has it.
+    fn value(&self, name: &str) -> Option<i32> {
+        let i = DEFS.iter().position(|d| d.name == name)?;
+        Some(self.vals.get(i).copied().flatten()?.value)
+    }
+
+    /// The overlays chosen, over the frame shown in `rect`.
+    fn overlays_ui(&mut self, ctx: &egui::Context, p: &egui::Painter, rect: egui::Rect, image: &egui::ColorImage, at: Instant) {
+        let o = &self.overlays;
+        let (zoom, pan, tilt) = (self.value("zoom").unwrap_or(100), self.value("pan").unwrap_or(0), self.value("tilt").unwrap_or(0));
+        let view = overlay::View::new(image.size, zoom, pan, tilt);
+        if !(o.metering || o.clipping || o.histogram) {
+            if o.grid {
+                overlay::draw_grid(p, rect);
+            }
+            return;
+        }
+        // Measured once a frame, and again when the view moves.
+        if self.measured.as_ref().is_none_or(|m| m.at != at || m.view != view || (o.clipping && !m.masked)) {
+            let (m, mask) = overlay::measure(image, &view);
+            if o.clipping {
+                match &mut self.mask {
+                    Some(t) => t.set(mask, egui::TextureOptions::LINEAR),
+                    None => self.mask = Some(ctx.load_texture("clipping", mask, egui::TextureOptions::LINEAR)),
+                }
+            }
+            self.measured = Some(Measured { at, view, masked: o.clipping, m });
+        }
+        let Some(Measured { m, .. }) = &self.measured else { return };
+        let mut legend = Vec::new();
+        if let (true, Some(mask)) = (o.clipping, &self.mask) {
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            p.image(mask.id(), rect, uv, egui::Color32::WHITE);
+            let text = format!("Clipped (stripes) {:.1}%  ·  crushed (blue) {:.1}%", m.clipped * 100.0, m.crushed * 100.0);
+            legend.push(vec![Item::Text(text)]);
+        }
+        if o.grid {
+            overlay::draw_grid(p, rect);
+        }
+        if o.metering {
+            let mode = self.value("metering").and_then(Metering::from_value);
+            let (slices, [min, median, max]) = overlay::slices(&m.zones);
+            let none = overlay::Grid::<bool>::default();
+            let (weights, marked) = match mode {
+                Some(Metering::Subject) => {
+                    let (w, marked) = overlay::subject(&view, &overlay::linear(&m.zones));
+                    (Some(w), marked)
+                }
+                Some(Metering::Tuning) | None => (None, none),
+                Some(mode) => (Some(overlay::weights(&view, mode)), none),
+            };
+            overlay::draw_metering(p, rect, &view, weights.as_ref(), &slices, &marked, mode == Some(Metering::Spot));
+            let mut name = match mode {
+                Some(Metering::Tuning) => "tuning default, whose weights the camera doesn't report",
+                Some(Metering::Average) => "average",
+                Some(Metering::Center) => "center-weighted",
+                Some(Metering::Spot) => "spot",
+                Some(Metering::Subject) => "subject, estimated from the picture (X: the subject)",
+                None => "not reported by this camera",
+            }
+            .to_string();
+            if self.value("auto-exposure") == Some(1) {
+                name += "; unused, as exposure is manual";
+            }
+            legend.push(vec![Item::Text(format!("Metering: {name}"))]);
+            let size = if weights.is_some() { "Dot size: zone weight" } else { "Rings: weight unknown" };
+            legend.push(vec![Item::Text(format!("{size}  ·  colour: zone brightness"))]);
+            let s = overlay::SLICES;
+            legend.push(vec![
+                Item::Swatch(s[0]),
+                Item::Text(format!("{min:.0}")),
+                Item::Swatch(s[1]),
+                Item::Swatch(s[2]),
+                Item::Text(format!("median {median:.0}")),
+                Item::Swatch(s[3]),
+                Item::Swatch(s[4]),
+                Item::Text(format!("{max:.0}")),
+            ]);
+        }
+        if o.histogram {
+            let width = (rect.width() * 0.3).clamp(100.0, 256.0);
+            let size = egui::vec2(width, width * 0.4);
+            overlay::draw_histogram(p, egui::Rect::from_min_size(rect.right_bottom() - size - egui::vec2(6.0, 6.0), size), &m.hist);
+            let (median, top) = (overlay::level(&m.hist, 0.5), overlay::level(&m.hist, 0.01));
+            legend.push(vec![Item::Text(format!("Luma: median {median} (white)  ·  brightest 1% from {top} (yellow)"))]);
+        }
+        if !legend.is_empty() {
+            overlay::draw_legend(p, rect.min + egui::vec2(6.0, 6.0), &legend);
+        }
+    }
+
+    /// The overlays to choose from, at the top right of the picture.
+    fn overlay_menu(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let o = &mut self.overlays;
+        let on = [o.metering, o.clipping, o.histogram, o.grid].into_iter().filter(|b| *b).count();
+        let label = if on == 0 { "Overlays".to_string() } else { format!("Overlays ({on})") };
+        let corner = egui::UiBuilder::new().max_rect(rect.shrink(6.0)).layout(egui::Layout::right_to_left(egui::Align::Min));
+        ui.scope_builder(corner, |ui| {
+            let stay = egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+            egui::containers::menu::MenuButton::new(label).config(stay).ui(ui, |ui| {
+                ui.checkbox(&mut o.metering, "Metering")
+                    .on_hover_text("Where the camera meters exposure (dot size) and how bright each of its zones is (colour)");
+                ui.checkbox(&mut o.clipping, "Clipping").on_hover_text("Stripes over blown highlights, blue over crushed shadows");
+                ui.checkbox(&mut o.histogram, "Histogram").on_hover_text("How bright the picture is, pixel by pixel");
+                ui.checkbox(&mut o.grid, "Grid").on_hover_text("Thirds and the centre, for aiming the camera");
+            });
+        });
     }
 
     fn snapshot(&mut self) {

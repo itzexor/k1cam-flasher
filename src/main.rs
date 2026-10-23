@@ -11,6 +11,8 @@ mod job;
 mod linux;
 mod ops;
 #[cfg(feature = "gui")]
+mod overlay;
+#[cfg(feature = "gui")]
 mod tuning;
 mod usb;
 #[cfg(all(feature = "gui", target_os = "linux"))]
