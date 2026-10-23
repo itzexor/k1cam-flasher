@@ -8,7 +8,7 @@ A small, single-binary GUI to back up, flash and update the Creality K1 camera (
 - **Console**: appears once the camera's USB serial console (CDC-ACM, same USB ids) is detected. Press *Connect* to open it. It doesn't connect while another program has the port open (Linux), so that program keeps its output; while connected, other programs can't open the port until you press *Disconnect*. Type a line and press Enter (an empty line wakes the prompt), *Ctrl-C* stops what runs in the foreground. After a reboot or unplug, press *Connect* again.
 - **Help** (the *?* tab): forcing cloner mode (see below), drivers and permissions.
 
-A dot on each tab shows whether its device is attached. Dropping a `k1cam.upd` on the window opens it on the A/B tab, a `.bin` image on Backup & Flash. Closing the window while an operation runs asks first.
+A dot on each tab shows whether its device is attached. *Log*, at the top right, shows what operations did and how they ended; it opens by itself when one starts, and counts the lines not seen yet. Dropping a `k1cam.upd` on the window opens it on the A/B tab, a `.bin` image on Backup & Flash. Closing the window while an operation runs asks first.
 
 | Backup & Flash | A/B Update | Help |
 |---|---|---|

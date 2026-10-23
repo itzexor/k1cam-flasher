@@ -111,6 +111,10 @@ struct App {
     quit_prompt: bool,
     /// Close as soon as the job has stopped.
     quit_after: bool,
+    /// The log shows (it also does while a job runs), and how many of its
+    /// lines have been seen.
+    log_open: bool,
+    log_seen: usize,
 }
 
 /// A chosen .upd, read and checked when chosen and again whenever the file changes.
@@ -270,6 +274,8 @@ impl App {
             tuning: tuning::Tuning::new(),
             quit_prompt: false,
             quit_after: false,
+            log_open: false,
+            log_seen: 0,
         }
     }
 
@@ -297,6 +303,8 @@ impl App {
         self.cancel.store(false, Ordering::Relaxed);
         self.results.remove(&op);
         self.note(Level::Start, op.title());
+        // A job's progress and what it says show in the log.
+        self.log_open = true;
         let now = Instant::now();
         self.job = Some(Running { op, rx, started: now, progress: 0.0, step: now });
         let job = Job::new(tx.clone(), self.cancel.clone());
@@ -777,6 +785,9 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Log").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add_enabled(!self.busy(), egui::Button::new("Hide").small()).clicked() {
+                    self.log_open = false;
+                }
                 if ui.add_enabled(!self.log.is_empty(), egui::Button::new("Clear").small()).clicked() {
                     self.log.clear();
                 }
@@ -1002,7 +1013,14 @@ impl eframe::App for App {
             ui.add_space(6.0);
             let (cloner, camera, console) = (self.cloner_up, self.camera_up, self.console.connected());
             let tab = self.tab;
-            let (left, right) = egui::Sides::new().show(
+            // The log's button counts the lines not seen yet, in red if one failed.
+            let unseen = &self.log[self.log_seen.min(self.log.len())..];
+            let mut log = RichText::new(if unseen.is_empty() { "Log".to_string() } else { format!("Log ({})", unseen.len()) });
+            if unseen.iter().any(|l| l.level == Level::Failed) {
+                log = log.color(err_color(ui));
+            }
+            let log_open = self.log_open;
+            let (left, (right, toggle_log)) = egui::Sides::new().show(
                 ui,
                 |ui| {
                     let mut pick = None;
@@ -1048,15 +1066,23 @@ impl eframe::App for App {
                 },
                 |ui| {
                     let help = egui::Button::selectable(tab == Tab::Help, RichText::new(" ? ").strong());
-                    ui.add(help).on_hover_text("Help: cloner mode, drivers, about").clicked().then_some(Tab::Help)
+                    let help = ui.add(help).on_hover_text("Help: cloner mode, drivers, about").clicked().then_some(Tab::Help);
+                    let log = ui.add(egui::Button::selectable(log_open, log)).on_hover_text("Operations and their results");
+                    (help, log.clicked())
                 },
             );
             if let Some(t) = left.or(right) {
                 self.tab = t;
             }
+            if toggle_log {
+                self.log_open = !self.log_open;
+            }
             ui.add_space(4.0);
         });
-        egui::Panel::bottom("log").resizable(true).default_size(120.0).min_size(70.0).show(ui, |ui| self.log_panel(ui));
+        if self.log_open || self.busy() {
+            egui::Panel::bottom("log").resizable(true).default_size(120.0).min_size(70.0).show(ui, |ui| self.log_panel(ui));
+            self.log_seen = self.log.len();
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             if self.busy() {
                 ui.disable();
