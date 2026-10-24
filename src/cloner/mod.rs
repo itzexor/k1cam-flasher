@@ -207,14 +207,14 @@ impl<'a> Cloner<'a> {
     /// Uploads DDR config, SPL and the burner U-Boot so the SoC runs the cloner firmware.
     fn bootstrap(&self) -> R<()> {
         let soc = self.detect_soc()?;
-        self.job.log(format!("SoC: {soc}"));
+        self.job.log(format!("Boot ROM in USB boot mode, SoC: {soc}"));
         self.job.log("Loading DDR config and SPL");
         self.load(0x8000_1000, DDR)?;
         self.load(0x8000_1800, SPL)?;
         self.addr_req(VR_SET_DATA_LEN, 0x7000)?;
         self.addr_req(VR_PROG_STAGE1, 0x8000_1800)?;
         ms(2000);
-        self.job.log("Loading burner U-Boot");
+        self.job.log("Loading the cloner (burner U-Boot)");
         self.load(0x8010_0000, UBOOT)?;
         ms(500);
         let _ = self.vout(VR_FLUSH_CACHE, 0, 0, &[]);
@@ -258,7 +258,7 @@ impl<'a> Cloner<'a> {
     fn prepare(&mut self, erase: bool) -> R<ChipInfo> {
         if !self.is_firmware_stage()? {
             self.bootstrap()?;
-            self.job.log("Waiting for the burner to start");
+            self.job.log("Waiting for the cloner to start");
             ms(2000);
             // The device may re-enumerate; reopen the handle.
             let job = self.job;
@@ -267,7 +267,7 @@ impl<'a> Cloner<'a> {
             let old = std::mem::replace(self, new);
             drop(old);
             if !self.is_firmware_stage()? {
-                return Err("the burner firmware did not start".into());
+                return Err("the cloner (burner U-Boot) did not start".into());
             }
         }
         self.fw_write2(MARKER)?;

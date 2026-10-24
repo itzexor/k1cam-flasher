@@ -2,11 +2,11 @@
 
 A small, single-binary GUI to back up, flash and update the Creality K1 camera (Ingenic T31L, 8 MiB SPI NOR) on Linux, Windows and macOS, and the same operations as a command line, which also builds as a small static binary for the Linux boards a camera gets plugged into (see [Command line](#command-line) and [Static builds](#static-builds)).
 
-- **Backup & Flash (cloner)**: full read and full flash through the Ingenic USB bootrom cloner protocol, ported from [thingino-dfu](https://github.com/gtxaspec/thingino-dfu) (T31 family only), with read-back verification.
+- **Backup & Flash (cloner)**: full read and full flash with the Ingenic cloner protocol, through the boot ROM's USB boot mode, ported from [thingino-dfu](https://github.com/gtxaspec/thingino-dfu) (T31 family only), with read-back verification.
 - **A/B Update (k1cam)**: dump, update the inactive slot, reboot into the trial or cancel it, over the k1cam UVC extension unit protocol (same as `uvcdctl firmware`). On Linux it uses the uvcvideo XU ioctl on `/dev/videoN` (needs access to the video node, e.g. the `video` group); on macOS it uses libusb (untested). Not available on Windows. The tab shows what the connected camera runs (build, kernel commit, slots, boot state) next to what the chosen `k1cam.upd` holds (build, commit, kernel, sizes against the slot sizes, and its os-release, after checking its digests), and whether the camera would take it. `k1cam-flasher FILE.upd` opens the A/B tab with that bundle.
 - **Tuning** (Linux): press *Connect* for the camera's picture, live (MJPEG at a size and rate you choose), as large as the window allows with every image control still in view: picture, exposure, white balance, noise, view and encoder settings, as `uvcdctl` names them, flowing down columns beside and below the picture. The camera keeps every change itself; an active control that differs from its default stands out, clicking its name puts the default back, and *Factory defaults* resets them all. Exposure time and white balance temperature have an *auto* check box on their row, and while it is on the slider follows what the camera chooses (white balance once uvcd reports it). *Overlays* on the picture show where the camera meters exposure and how bright each of its zones is, clipped highlights and crushed shadows, a histogram and a framing grid, and the picture reads out the pixel under the pointer. *Snapshot* saves the frame on screen as the camera sent it (JPEG). The preview runs only while the tab is shown; *Pause* frees the video, and *Disconnect* closes tuning entirely.
 - **Console**: the camera's USB serial console (CDC-ACM, same USB ids). *Connect* works once the console is detected; press it to open the console. It doesn't connect while another program has the port open (Linux), so that program keeps its output; while connected, other programs can't open the port until you press *Disconnect*. Type a line and press Enter (an empty line wakes the prompt), *Ctrl-C* stops what runs in the foreground. After a reboot or unplug, press *Connect* again.
-- **Help** (*Help*, top right): forcing cloner mode (see below), drivers and permissions.
+- **Help** (*Help*, top right): forcing USB boot mode (see below), drivers and permissions.
 
 The status bar under the tabs shows whether the open tab's device is attached (green when it is) and follows a running operation (blue): its progress, what it last said, the time taken and left, and *Cancel*. Beside Backup & Flash and A/B Update, the log shows each operation under a heading with when it started, how long it took and how it ended; it opens by itself when one starts, and folded away to a strip it counts the operations finished since, in red if one failed. A tab's lines are all there from the start, so nothing moves as results come in. Dropping a `k1cam.upd` on the window opens it on the A/B tab, a `.bin` image on Backup & Flash. Closing the window while an operation runs asks first.
 
@@ -16,7 +16,7 @@ The status bar under the tabs shows whether the open tab's device is attached (g
 
 > Not yet tested against real hardware. Take and check a backup before relying on it.
 
-## Getting the camera into cloner mode
+## Getting the camera into USB boot mode
 
 The bootrom only listens on USB when the SoC cannot boot from the NOR, so you short two NOR pins while it powers up.
 
@@ -40,7 +40,7 @@ ROM's cloner identity remains `a108:c309`. See the
 for the rationale and collision checks.
 
 - **Linux**: `sudo cp udev/99-k1cam-flasher.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger`. A/B Update and Tuning need access to the camera's `/dev/video*` node (the `video` group), the console to `/dev/ttyACM*` (the `dialout` group, `uucp` on Arch).
-- **Windows**: bind WinUSB to `a108:c309` with [Zadig](https://zadig.akeo.ie/) while the camera is in cloner mode.
+- **Windows**: bind WinUSB to `a108:c309` with [Zadig](https://zadig.akeo.ie/) while the camera is in USB boot mode.
 - **macOS**: nothing to install.
 
 ## Using it
@@ -68,9 +68,9 @@ k1cam-flasher info                      # a running camera's firmware informatio
 k1cam-flasher update k1cam.upd          # install into the inactive slot, reboot into the trial
 k1cam-flasher reboot | cancel           # start or withdraw a staged trial
 k1cam-flasher dump backup.bin [--live]  # the whole flash from a running camera
-k1cam-flasher detect                    # cloner mode: identify the flash chip
-k1cam-flasher backup backup.bin         # cloner mode: read the whole flash
-k1cam-flasher flash k1cam.bin --yes     # cloner mode: replace the whole flash
+k1cam-flasher detect                    # cloner: identify the flash chip
+k1cam-flasher backup backup.bin         # cloner: read the whole flash
+k1cam-flasher flash k1cam.bin --yes     # cloner: replace the whole flash
 k1cam-flasher check k1cam.upd           # what a bundle holds, no camera needed
 ```
 

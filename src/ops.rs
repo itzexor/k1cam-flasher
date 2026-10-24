@@ -58,7 +58,7 @@ pub fn flash(j: &Job, image: &Path, backup_first: bool, verify: bool, reboot: bo
     if reboot {
         cloner::Cloner::reboot(j)?;
     }
-    Ok("flashed".into())
+    Ok("flashed with the cloner".into())
 }
 
 pub fn dump(j: &Job, path: &Path, live: bool) -> Result<String, String> {

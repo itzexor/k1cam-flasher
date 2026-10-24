@@ -26,7 +26,7 @@ A running camera (k1cam firmware, A/B layout):
   cancel                  withdraw a staged trial
   dump FILE [--live]      save the whole flash (8 MiB)
 
-A camera in cloner mode (bootrom, a108:c309; see the README):
+With the cloner, on a camera in USB boot mode (boot ROM, a108:c309; see the README):
   detect                  identify the flash chip
   backup FILE             save the whole flash (8 MiB)
   flash FILE.bin --yes [--no-backup] [--no-verify] [--no-reboot]
@@ -76,7 +76,7 @@ pub fn run(args: &[String]) -> Option<i32> {
         return Some(report(Err("no camera running k1cam firmware is attached (USB f055:4b31 or 1d6b:0110)".into())));
     }
     if matches!(cmd, "detect" | "backup" | "flash") && !cloner::device_present() {
-        return Some(report(Err("no camera in cloner mode is attached (USB a108:c309); see the README".into())));
+        return Some(report(Err("no camera in USB boot mode is attached (USB a108:c309); see the README".into())));
     }
     let file = files.first().map(PathBuf::from).unwrap_or_default();
     Some(match cmd {

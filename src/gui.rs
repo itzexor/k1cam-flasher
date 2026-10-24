@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The GUI: cloner backup and flash, A/B update, tuning with a live preview,
-//! the camera's console, and help on forcing cloner mode.
+//! the camera's console, and help on forcing USB boot mode.
 
 use crate::job::{Event, Job};
 use crate::{bundle, cloner, console, ops, tuning, xu};
@@ -38,8 +38,8 @@ impl Op {
     fn title(self) -> &'static str {
         match self {
             Op::Detect => "Detect flash chip",
-            Op::Backup => "Backup",
-            Op::Flash => "Flash",
+            Op::Backup => "Back up with the cloner",
+            Op::Flash => "Flash with the cloner",
             Op::Dump => "Dump flash",
             Op::Update => "A/B update",
             Op::Reboot => "Reboot into trial",
@@ -50,7 +50,7 @@ impl Op {
     /// What quitting halfway leaves behind.
     fn risk(self) -> &'static str {
         match self {
-            Op::Flash => "Stopping a flash halfway leaves the camera unable to boot until it is flashed again in cloner mode.",
+            Op::Flash => "Stopping a flash halfway leaves the camera unable to boot until it is flashed again with the cloner.",
             Op::Update => "The camera keeps booting what it runs now; an install it has already started still finishes.",
             Op::Backup | Op::Dump => "Stopping now leaves no backup.",
             _ => "It stops cleanly.",
@@ -524,9 +524,9 @@ impl App {
                     });
                 }
                 if !self.cloner_up && !self.busy() {
-                    line(ui, weak_color(ui), "Waiting for a camera in cloner mode.")
+                    line(ui, weak_color(ui), "Waiting for a camera in USB boot mode.")
                         .on_hover_text("The camera answers here when it powers up with two pins of its flash chip shorted.");
-                    if ui.link("How to short the pins").clicked() {
+                    if ui.link("How to connect the camera for flashing").clicked() {
                         self.tab = Tab::Help;
                     }
                 } else {
@@ -766,8 +766,8 @@ impl App {
     }
 
     fn help_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Getting the camera into cloner mode");
-        ui.label("The camera only talks the cloner protocol when its SoC cannot boot from the flash. Shorting two of the flash chip's pins while it powers up does that.");
+        ui.heading("Getting the camera into USB boot mode");
+        ui.label("The camera only boots from USB, where the cloner can reach it, when its SoC cannot boot from the flash. Shorting two of the flash chip's pins while it powers up does that.");
         ui.add_space(8.0);
         let steps = [
             "Unplug the camera's USB cable and any power.",
@@ -818,7 +818,7 @@ impl App {
         ui.label("A/B Update and Tuning need the camera's /dev/video node (the video group); the console needs /dev/ttyACM* (dialout, or uucp on Arch).");
         ui.add_space(6.0);
         ui.label(RichText::new("Windows").strong());
-        ui.label("Bind WinUSB to a108:c309 with Zadig while the camera is in cloner mode.");
+        ui.label("Bind WinUSB to a108:c309 with Zadig while the camera is in USB boot mode.");
         ui.add_space(6.0);
         ui.label(RichText::new("macOS").strong());
         ui.label("Nothing to install.");
@@ -922,8 +922,8 @@ impl App {
     /// The open tab's device: whether it is there, what it is, and a detail.
     fn device_status(&self) -> Option<(bool, &'static str, String)> {
         Some(match self.tab {
-            Tab::Cloner if self.cloner_up => (true, "Camera in cloner mode", "USB a108:c309".to_string()),
-            Tab::Cloner => (false, "No camera in cloner mode", String::new()),
+            Tab::Cloner if self.cloner_up => (true, "Camera in USB boot mode", "USB a108:c309".to_string()),
+            Tab::Cloner => (false, "No camera in USB boot mode", String::new()),
             Tab::Update | Tab::Tuning if self.camera_up => {
                 let slot = match &self.cam_info {
                     Some(Ok(i)) => xu::record_value(i, "running_slot").map(|s| format!("connected · slot {}", s.to_uppercase())),
@@ -1146,7 +1146,7 @@ fn help_button(ui: &mut egui::Ui, selected: bool) -> bool {
         let font = egui::FontId::proportional(13.0);
         painter.text(rect.center() + egui::vec2(0.0, 0.5), egui::Align2::CENTER_CENTER, "?", font, ui.visuals().panel_fill);
     }
-    r.response.on_hover_text("Help: cloner mode, drivers, about").clicked()
+    r.response.on_hover_text("Help: USB boot mode, drivers, about").clicked()
 }
 
 /// One line of the log, timed.
@@ -1253,7 +1253,7 @@ impl eframe::App for App {
                         ui,
                         Tab::Cloner,
                         "Backup & Flash",
-                        "The whole 8 MiB flash, through the Ingenic boot ROM's USB mode (cloner): for installing k1cam once, \
+                        "The whole 8 MiB flash, with Ingenic's cloner, through the boot ROM's USB boot mode: for installing k1cam once, \
                          and for a camera that no longer boots.",
                     );
                     item(
