@@ -6,9 +6,9 @@ A small, single-binary GUI to back up, flash and update the Creality K1 camera (
 - **A/B Update (k1cam)**: dump, update the inactive slot, reboot into the trial or cancel it, over the k1cam UVC extension unit protocol (same as `uvcdctl firmware`). On Linux it uses the uvcvideo XU ioctl on `/dev/videoN` (needs access to the video node, e.g. the `video` group); on macOS it uses libusb (untested). Not available on Windows. The tab shows what the connected camera runs (build, kernel commit, slots, boot state) next to what the chosen `k1cam.upd` holds (build, commit, kernel, sizes against the slot sizes, and its os-release, after checking its digests), and whether the camera would take it. `k1cam-flasher FILE.upd` opens the A/B tab with that bundle.
 - **Tuning** (Linux): press *Connect* for the camera's picture, live (MJPEG at a size and rate you choose), as large as the window allows with every image control still in view: picture, exposure, white balance, noise, view and encoder settings, as `uvcdctl` names them, flowing down columns beside and below the picture. The camera keeps every change itself; an active control that differs from its default stands out, clicking its name puts the default back, and *Factory defaults* resets them all. Exposure time and white balance temperature have an *auto* check box on their row, and while it is on the slider follows what the camera chooses (white balance once uvcd reports it). *Overlays* on the picture show where the camera meters exposure and how bright each of its zones is, clipped highlights and crushed shadows, a histogram and a framing grid, and the picture reads out the pixel under the pointer. *Snapshot* saves the frame on screen as the camera sent it (JPEG). The preview runs only while the tab is shown; *Pause* frees the video, and *Disconnect* closes tuning entirely.
 - **Console**: appears once the camera's USB serial console (CDC-ACM, same USB ids) is detected. Press *Connect* to open it. It doesn't connect while another program has the port open (Linux), so that program keeps its output; while connected, other programs can't open the port until you press *Disconnect*. Type a line and press Enter (an empty line wakes the prompt), *Ctrl-C* stops what runs in the foreground. After a reboot or unplug, press *Connect* again.
-- **Help** (the *?* tab): forcing cloner mode (see below), drivers and permissions.
+- **Help** (*Help*, top right): forcing cloner mode (see below), drivers and permissions.
 
-A dot on each tab shows whether its device is attached. *Log*, at the top right, shows what operations did and how they ended; it opens by itself when one starts, and counts the lines not seen yet. Dropping a `k1cam.upd` on the window opens it on the A/B tab, a `.bin` image on Backup & Flash. Closing the window while an operation runs asks first.
+The status bar under the tabs shows whether the open tab's device is attached (green when it is) and follows a running operation (blue): its progress, what it last said, the time taken and left, and *Cancel*. Beside Backup & Flash and A/B Update, the log shows each operation under a heading with when it started, how long it took and how it ended; it opens by itself when one starts, and folded away to a strip it counts the operations finished since, in red if one failed. A tab's lines are all there from the start, so nothing moves as results come in. Dropping a `k1cam.upd` on the window opens it on the A/B tab, a `.bin` image on Backup & Flash. Closing the window while an operation runs asks first.
 
 | Backup & Flash | A/B Update | Help |
 |---|---|---|
@@ -27,7 +27,7 @@ The bootrom only listens on USB when the SoC cannot boot from the NOR, so you sh
 3. Keep holding while you plug in USB so the camera powers up.
 4. After about a second release the short. `lsusb` shows `a108:c309` and the app shows a green status.
 
-The short only matters at power-up. If the device does not appear, power-cycle and retry. The same text is in the app's help (the *?* tab).
+The short only matters at power-up. If the device does not appear, power-cycle and retry. The same text is in the app's help (*Help*).
 
 ## Driver setup
 
@@ -50,14 +50,14 @@ or read its controls. On A/B Update, *Connect* reads the firmware information
 and *Refresh* reads it again. Choosing a valid `.upd` also reads an attached
 camera's information for comparison. Firmware operations disconnect tuning
 and the console and wait for their device access to finish before starting;
-press *Connect* again to use them afterward. While an operation runs, tab
-switching, file loading (including drops), and camera controls are locked;
-Cancel and the log remain available.
+press *Connect* again to use them afterward. While an operation runs, file
+loading (including drops) and camera controls are locked; the tabs, the log
+and Cancel remain available.
 
 - Backup: *Detect flash chip* checks the link, *Back up flash...* saves the 8 MiB image and shows its SHA-256. Backups are named for the time in UTC (`k1cam-backup-20261020T073812Z.bin`).
 - Flash: choose `k1cam.bin` (exactly 8 MiB; the tab checks the size when you choose it), optionally back up first, tick the confirmation, press *Flash*. This replaces U-Boot and installs the A/B layout once. After that, update with `k1cam.upd` on the A/B tab.
 - Update: choose `k1cam.upd` and compare it with what the camera runs; the bundle is read again when the file changes on disk, and what is shown is what gets installed. The camera is sent the bundle only, not the release information after it, so cameras on firmware from before that section was added take these files too.
-- Progress shows below the tab with the time taken and, for long steps, the time left; each operation's outcome shows where it was started and in the log.
+- Progress shows in the status bar with the time taken and, for long steps, the time left; each operation's outcome shows beside the button that started it and in the log, which *Copy* and *Save…* take as text.
 
 ## Command line
 

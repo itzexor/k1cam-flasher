@@ -80,6 +80,11 @@ enum Level {
 struct Line {
     level: Level,
     text: String,
+    /// The time of day for the reader, and the instant for durations.
+    time: String,
+    at: Instant,
+    /// A Start line's operation shows its lines; only the newest does by default.
+    open: bool,
 }
 
 struct App {
@@ -111,9 +116,9 @@ struct App {
     quit_prompt: bool,
     /// Close as soon as the job has stopped.
     quit_after: bool,
-    /// The log shows (it also does while a job runs), and how many of its
-    /// lines have been seen.
-    log_open: bool,
+    /// The log beside Backup & Flash and A/B Update is folded to a strip, and
+    /// how many of its lines have been seen.
+    log_collapsed: bool,
     log_seen: usize,
 }
 
@@ -185,6 +190,52 @@ pub fn status(ui: &mut egui::Ui, color: Color32, text: impl Into<egui::WidgetTex
     .response
 }
 
+/// A dot, then the text cut to one line (all of it on hover), for a line
+/// that is always there so that what comes and goes in it moves nothing else.
+fn line(ui: &mut egui::Ui, color: Color32, text: &str) -> egui::Response {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, ui.text_style_height(&egui::TextStyle::Body)), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
+    ui.add(egui::Label::new(RichText::new(text).color(color)).truncate())
+}
+
+/// The time of day, local where the platform tells what local is.
+fn wall_clock(t: SystemTime) -> String {
+    let secs = t.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    #[cfg(unix)]
+    {
+        let t = secs as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if !unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+            return format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec);
+        }
+    }
+    let s = secs % 86400;
+    format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+}
+
+/// A chevron pointing along `dir`, painted: the fonts have no arrows.
+fn chevron(painter: &egui::Painter, center: egui::Pos2, dir: egui::Vec2, color: Color32) {
+    let (s, side) = (3.5, egui::vec2(-dir.y, dir.x));
+    let back = center - dir * s * 0.5;
+    painter.line(vec![back + side * s, center + dir * s * 0.5, back - side * s], egui::Stroke::new(1.5, color));
+}
+
+/// The log's unread mark: how many operations finished, red if one failed,
+/// or a dot for lines alone.
+fn badge(ui: &egui::Ui, center: egui::Pos2, (done, failed): (usize, bool)) {
+    let painter = ui.painter();
+    if done == 0 {
+        painter.circle_filled(center, 3.5, ui.visuals().text_color());
+        return;
+    }
+    let fill = if failed { Color32::from_rgb(210, 60, 60) } else { ui.visuals().widgets.inactive.bg_fill };
+    let text = if failed { Color32::WHITE } else { ui.visuals().strong_text_color() };
+    let galley = painter.layout_no_wrap(done.to_string(), egui::FontId::proportional(11.0), text);
+    let rect = egui::Rect::from_center_size(center, egui::vec2((galley.size().x + 10.0).max(18.0), 17.0));
+    painter.rect_filled(rect, 8.5, fill);
+    painter.galley(rect.center() - galley.size() / 2.0, galley, text);
+}
+
 /// Sizes as the firmware's documents give them: whole MiB, else KiB.
 fn bytes(n: u64) -> String {
     const MIB: u64 = 1024 * 1024;
@@ -223,13 +274,6 @@ fn card<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R)
         .inner;
     ui.add_space(8.0);
     r
-}
-
-/// A tab's title and what it is for.
-fn intro(ui: &mut egui::Ui, title: &str, text: &str) {
-    ui.heading(title);
-    ui.label(RichText::new(text).color(weak_color(ui)));
-    ui.add_space(8.0);
 }
 
 /// A chosen file: its name, its folder dimmed, the whole path on hover.
@@ -274,7 +318,7 @@ impl App {
             tuning: tuning::Tuning::new(),
             quit_prompt: false,
             quit_after: false,
-            log_open: false,
+            log_collapsed: false,
             log_seen: 0,
         }
     }
@@ -284,7 +328,32 @@ impl App {
     }
 
     fn note(&mut self, level: Level, text: impl Into<String>) {
-        self.log.push(Line { level, text: text.into() });
+        // A new operation folds the ones before it.
+        if level == Level::Start {
+            self.log.iter_mut().for_each(|l| l.open = false);
+        }
+        let (time, at) = (wall_clock(SystemTime::now()), Instant::now());
+        self.log.push(Line { level, text: text.into(), time, at, open: level == Level::Start });
+    }
+
+    fn log_text(&self) -> String {
+        self.log
+            .iter()
+            .map(|l| match l.level {
+                Level::Start => format!("{} --- {} ---\n", l.time, l.text),
+                Level::Ok => format!("{} OK: {}\n", l.time, l.text),
+                Level::Failed => format!("{} FAILED: {}\n", l.time, l.text),
+                Level::Info => format!("{} {}\n", l.time, l.text),
+            })
+            .collect()
+    }
+
+    /// What reached the log since it last showed: operations finished, and
+    /// whether one failed.
+    fn unread(&self) -> Option<(usize, bool)> {
+        let new = &self.log[self.log_seen.min(self.log.len())..];
+        let done = new.iter().filter(|l| matches!(l.level, Level::Ok | Level::Failed)).count();
+        (!new.is_empty()).then(|| (done, new.iter().any(|l| l.level == Level::Failed)))
     }
 
     fn start<F>(&mut self, op: Op, f: F)
@@ -303,8 +372,8 @@ impl App {
         self.cancel.store(false, Ordering::Relaxed);
         self.results.remove(&op);
         self.note(Level::Start, op.title());
-        // A job's progress and what it says show in the log.
-        self.log_open = true;
+        // What a job says shows in the log.
+        self.log_collapsed = false;
         let now = Instant::now();
         self.job = Some(Running { op, rx, started: now, progress: 0.0, step: now });
         let job = Job::new(tx.clone(), self.cancel.clone());
@@ -343,15 +412,19 @@ impl App {
                 Event::Done(r) => done = Some(r),
             }
         }
-        let (op, took) = (job.op, job.started.elapsed());
+        let op = job.op;
         for l in lines {
             self.note(Level::Info, l);
         }
         let Some(r) = done else { return };
-        let took = if took > Duration::from_secs(2) { format!(" ({})", clock(took)) } else { String::new() };
+        // The operation's heading in the log says how long it took.
         match &r {
-            Ok(m) => self.note(Level::Ok, format!("{m}{took}")),
-            Err(e) => self.note(Level::Failed, format!("{e}{took}")),
+            Ok(m) => self.note(Level::Ok, m.clone()),
+            Err(e) => self.note(Level::Failed, e.clone()),
+        }
+        // Installing, rebooting into a trial and cancelling it share one line.
+        if matches!(op, Op::Update | Op::Reboot | Op::Cancel) {
+            self.results.retain(|o, _| !matches!(o, Op::Update | Op::Reboot | Op::Cancel));
         }
         self.results.insert(op, r);
         self.job = None;
@@ -400,14 +473,23 @@ impl App {
         self.cam_info = None;
     }
 
-    /// The last outcome of `op`, if it ran since this tab was set up.
-    fn result(&self, ui: &mut egui::Ui, op: Op) {
-        match self.results.get(&op) {
-            Some(Ok(m)) => {
-                status(ui, ok_color(ui), RichText::new(m).color(ok_color(ui)));
+    /// Beside the button that starts them: one of `ops` running, or its last
+    /// outcome, else `idle` dimmed.
+    fn result_line(&self, ui: &mut egui::Ui, ops: &[Op], idle: &str) {
+        if self.job.as_ref().is_some_and(|j| ops.contains(&j.op)) {
+            ui.spinner();
+            ui.label(RichText::new("Running…").color(weak_color(ui)));
+            return;
+        }
+        match ops.iter().find_map(|o| self.results.get(o).map(|r| (o, r))) {
+            Some((_, Ok(m))) => {
+                line(ui, ok_color(ui), m);
             }
-            Some(Err(e)) => {
-                status(ui, err_color(ui), RichText::new(format!("{} failed: {e}", op.title())).color(err_color(ui)));
+            Some((op, Err(e))) => {
+                line(ui, err_color(ui), &format!("{} failed: {e}", op.title()));
+            }
+            None if !idle.is_empty() => {
+                ui.label(RichText::new(idle).color(weak_color(ui)));
             }
             None => {}
         }
@@ -426,17 +508,11 @@ impl App {
         }
     }
 
+    /// Every line on this tab is always there, so nothing moves as results come in.
     fn cloner_tab(&mut self, ui: &mut egui::Ui) {
-        intro(
-            ui,
-            "Backup & Flash",
-            "The whole 8 MiB flash, through the Ingenic boot ROM's USB mode (cloner): for installing k1cam once, \
-             and for a camera that no longer boots.",
-        );
         let idle = !self.busy() && self.cloner_up;
-        card(ui, "Camera in cloner mode", |ui| {
-            if self.cloner_up {
-                status(ui, ok_color(ui), "Attached (USB a108:c309)");
+        card(ui, "Flash chip", |ui| {
+            ui.horizontal(|ui| {
                 if ui
                     .add_enabled(idle, egui::Button::new("Detect flash chip"))
                     .on_hover_text("Checks the link and identifies the flash, without changing it")
@@ -447,43 +523,47 @@ impl App {
                         Ok(format!("{}, {} (JEDEC {:06x})", c.name, bytes(c.size as u64), c.jedec))
                     });
                 }
-            } else {
-                status(ui, weak_color(ui), "Not connected");
-                ui.label("The camera answers here when it powers up with two pins of its flash chip shorted.");
-                if ui.link("How to short the pins").clicked() {
-                    self.tab = Tab::Help;
+                if !self.cloner_up && !self.busy() {
+                    line(ui, weak_color(ui), "Waiting for a camera in cloner mode.")
+                        .on_hover_text("The camera answers here when it powers up with two pins of its flash chip shorted.");
+                    if ui.link("How to short the pins").clicked() {
+                        self.tab = Tab::Help;
+                    }
+                } else {
+                    self.result_line(ui, &[Op::Detect], "Not detected yet");
                 }
-            }
-            self.result(ui, Op::Detect);
+            });
         });
         card(ui, "Backup", |ui| {
-            ui.label("Reads the whole flash into a file and shows its SHA-256.");
-            if ui.add_enabled(idle, egui::Button::new("Back up flash…")).clicked() {
-                if let Some(path) = rfd::FileDialog::new().set_file_name(backup_name()).save_file() {
-                    self.start(Op::Backup, move |j| ops::backup(j, &path));
+            ui.label(RichText::new("Reads the whole flash into a file and shows its SHA-256.").color(weak_color(ui)));
+            ui.horizontal(|ui| {
+                if ui.add_enabled(idle, egui::Button::new("Back up flash…")).clicked() {
+                    if let Some(path) = rfd::FileDialog::new().set_file_name(backup_name()).save_file() {
+                        self.start(Op::Backup, move |j| ops::backup(j, &path));
+                    }
                 }
-            }
-            self.result(ui, Op::Backup);
+                self.result_line(ui, &[Op::Backup], "No backup yet");
+            });
         });
         card(ui, "Flash", |ui| {
-            ui.label("Replaces the whole flash: U-Boot, both slots and the settings. This installs the A/B layout, once; after that, update with k1cam.upd on the A/B Update tab.");
-            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Replaces the whole flash: U-Boot, both slots and the settings. This installs the A/B layout, once; \
+                     after that, update with k1cam.upd on the A/B Update tab.",
+                )
+                .color(weak_color(ui)),
+            );
             ui.horizontal(|ui| {
                 if ui.button("Choose image…").clicked() {
                     self.choose_image();
                 }
                 file_row(ui, self.image.as_ref().map(|i| i.path.as_path()), "no image chosen (k1cam.bin)");
             });
-            match self.image.as_ref().map(|i| &i.check) {
-                Some(Ok(())) => {
-                    status(ui, ok_color(ui), "8 MiB, a whole-flash image");
-                }
-                Some(Err(e)) => {
-                    status(ui, err_color(ui), RichText::new(e).color(err_color(ui)));
-                }
-                None => {}
-            }
-            ui.add_space(4.0);
+            ui.horizontal(|ui| match self.image.as_ref().map(|i| &i.check) {
+                Some(Ok(())) => line(ui, ok_color(ui), "8 MiB, a whole-flash image"),
+                Some(Err(e)) => line(ui, err_color(ui), e),
+                None => line(ui, weak_color(ui), "An 8 MiB whole-flash image"),
+            });
             ui.checkbox(&mut self.backup_first, "Back up the current flash first (next to the image)");
             ui.checkbox(&mut self.verify, "Read back and verify after writing");
             ui.checkbox(&mut self.reboot_after, "Reboot the camera when done");
@@ -494,34 +574,32 @@ impl App {
             if can {
                 button = button.fill(err_color(ui).gamma_multiply(0.55));
             }
-            ui.add_space(2.0);
-            if ui.add_enabled(can, button).clicked() {
-                let image = image.unwrap();
-                let (b, v, r) = (self.backup_first, self.verify, self.reboot_after);
-                self.confirm = false;
-                self.start(Op::Flash, move |j| ops::flash(j, &image, b, v, r));
-            }
-            self.result(ui, Op::Flash);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(can, button).clicked() {
+                    let image = image.unwrap();
+                    let (b, v, r) = (self.backup_first, self.verify, self.reboot_after);
+                    self.confirm = false;
+                    self.start(Op::Flash, move |j| ops::flash(j, &image, b, v, r));
+                }
+                self.result_line(ui, &[Op::Flash], "");
+            });
         });
     }
 
+    /// Every line on this tab is always there: a bundle fills in its column of
+    /// the table, and the long lists open over the page.
     fn update_tab(&mut self, ui: &mut egui::Ui) {
-        intro(
-            ui,
-            "A/B Update",
-            "Updates a camera running k1cam firmware over USB. The update goes into the slot it isn't running and \
-             boots as a trial: the camera keeps it once it works, and goes back to the old one by itself otherwise.",
-        );
         if cfg!(windows) {
             status(ui, warn_color(ui), "Not available on Windows yet; use Linux or macOS, or the cloner on the Backup & Flash tab.");
             ui.add_space(8.0);
         }
         // Not while the info record is being read: one exchange at a time.
         let idle = !self.busy() && self.info_rx.is_none() && self.camera_up && !cfg!(windows);
-        card(ui, "Camera", |ui| self.camera_card(ui, idle));
-        card(ui, "Update", |ui| self.bundle_card(ui, idle));
+        card(ui, "Firmware", |ui| self.firmware_card(ui, idle));
         card(ui, "Backup", |ui| {
-            ui.label("Saves the whole flash of the running camera (8 MiB; it takes about three minutes).");
+            ui.label(
+                RichText::new("Saves the whole flash of the running camera (8 MiB; it takes about three minutes).").color(weak_color(ui)),
+            );
             ui.horizontal(|ui| {
                 if ui.add_enabled(idle, egui::Button::new("Dump flash…")).clicked() {
                     if let Some(path) = rfd::FileDialog::new().set_file_name(backup_name()).save_file() {
@@ -532,78 +610,92 @@ impl App {
                 ui.checkbox(&mut self.live_dump, "Live").on_hover_text(
                     "For a camera without the RAM for a snapshot: reads the flash as it changes, so the copy may be inconsistent (diagnostic)",
                 );
+                self.result_line(ui, &[Op::Dump], "");
             });
-            self.result(ui, Op::Dump);
         });
     }
 
-    fn camera_card(&mut self, ui: &mut egui::Ui, idle: bool) {
-        if !self.camera_up {
-            status(ui, weak_color(ui), "No camera running k1cam firmware is attached");
-            return;
-        }
-        let label = if matches!(self.cam_info, Some(Ok(_))) { "Refresh" } else { "Connect" };
-        if ui.add_enabled(!self.busy() && !self.reading_info(), egui::Button::new(label)).clicked() {
-            self.read_camera_info(camera_info);
-        }
+    /// The camera next to the chosen bundle, and installing it.
+    fn firmware_card(&mut self, ui: &mut egui::Ui, idle: bool) {
         let info = match &self.cam_info {
-            None => {
-                if self.reading_info() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Reading the camera's firmware information…");
-                    });
-                } else {
-                    ui.label("Choose a bundle or connect to read the camera's firmware information.");
-                }
-                return;
-            }
-            Some(Err(e)) => {
-                status(
-                    ui,
-                    warn_color(ui),
-                    RichText::new(format!("Attached, but its firmware information could not be read: {e}")).color(warn_color(ui)),
-                );
-                ui.label(RichText::new("Press Connect to try again.").color(weak_color(ui)));
-                return;
-            }
-            Some(Ok(info)) => info.clone(),
+            Some(Ok(i)) => Some(i.clone()),
+            _ => None,
         };
-        let get = |k| xu::record_value(&info, k).unwrap_or("");
-        status(ui, ok_color(ui), "Connected");
-        ui.add_space(4.0);
-        egui::Grid::new("camera").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-            ui.label("Build");
-            ui.monospace(get("build"));
-            ui.end_row();
-            ui.label("Kernel");
-            ui.monospace(get("kernel"));
-            ui.end_row();
-            ui.label("Slots");
-            slots(ui, &info);
-            ui.end_row();
-            ui.label("Boot");
-            ui.label(match get("boot") {
-                "confirmed" => "from its confirmed slot".to_string(),
-                "trial" => format!("trial, boot {} of {}", get("bootcount"), get("bootlimit")),
-                "fallback" => "fallback: the confirmed slot's kernel did not load".into(),
-                "single" => "single-slot layout (flash k1cam.bin once for A/B)".into(),
-                b => b.to_string(),
-            });
-            ui.end_row();
-        });
-        let trial = get("trial_slot").to_string();
-        if !trial.is_empty() {
-            ui.add_space(4.0);
-            let running = get("running_slot") == trial;
-            ui.label(if running {
-                format!("Slot {} runs as a trial: the camera keeps it once it has streamed video.", trial.to_uppercase())
-            } else {
-                format!("A trial of slot {} is staged: it starts at the next reboot.", trial.to_uppercase())
-            });
-            ui.horizontal(|ui| {
-                if !running && ui.add_enabled(idle, egui::Button::new("Reboot into trial")).clicked() {
-                    self.start(Op::Reboot, |_| xu::Camera::open()?.reboot().map(|_| "rebooting into the trial".into()));
+        let get = |k| info.as_deref().and_then(|i| xu::record_value(i, k)).unwrap_or("");
+        egui::Sides::new().shrink_left().show(
+            ui,
+            |ui| {
+                let label = if info.is_some() { "Refresh" } else { "Connect" };
+                let can = self.camera_up && !self.busy() && !self.reading_info() && !cfg!(windows);
+                if ui.add_enabled(can, egui::Button::new(label)).clicked() {
+                    self.read_camera_info(camera_info);
+                }
+                if !self.camera_up {
+                    line(ui, weak_color(ui), "No camera running k1cam firmware is attached");
+                } else if self.reading_info() {
+                    ui.spinner();
+                    ui.label("Reading the camera's firmware information…");
+                } else {
+                    match &self.cam_info {
+                        None => line(ui, weak_color(ui), "Connect, or choose a bundle, to read the camera's firmware information"),
+                        Some(Err(e)) => line(ui, warn_color(ui), &format!("Its firmware information could not be read: {e}")),
+                        Some(Ok(_)) => line(ui, ok_color(ui), "Connected"),
+                    };
+                }
+            },
+            |ui| {
+                let r = ui.add_enabled(info.is_some(), egui::Button::new("All fields…"));
+                let Some(info) = &info else { return };
+                egui::Popup::from_toggle_button_response(&r).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                        egui::Grid::new("camera-raw").num_columns(2).spacing([16.0, 2.0]).striped(true).show(ui, |ui| {
+                            for line in info.lines() {
+                                let (k, v) = line.split_once('=').unwrap_or((line, ""));
+                                ui.label(RichText::new(k).color(weak_color(ui)));
+                                ui.monospace(v);
+                                ui.end_row();
+                            }
+                        });
+                    });
+                    if ui.small_button("Copy").clicked() {
+                        ui.ctx().copy_text(info.clone());
+                    }
+                });
+            },
+        );
+        let trial = get("trial_slot");
+        let trial_runs = !trial.is_empty() && get("running_slot") == trial;
+        // As tall as the slots, before they are known too.
+        egui::Sides::new().height(26.0).shrink_left().show(
+            ui,
+            |ui| {
+                ui.label(RichText::new("Slots").color(weak_color(ui)));
+                let Some(info) = &info else {
+                    ui.label(RichText::new("—").color(weak_color(ui)));
+                    return;
+                };
+                slots(ui, info);
+                let mut boot = match get("boot") {
+                    "confirmed" => "boots from its confirmed slot".to_string(),
+                    "trial" => format!("trial, boot {} of {}", get("bootcount"), get("bootlimit")),
+                    "fallback" => "fallback: the confirmed slot's kernel did not load".into(),
+                    "single" => "single-slot layout (flash k1cam.bin once for A/B)".into(),
+                    b => b.to_string(),
+                };
+                if !trial.is_empty() && !trial_runs {
+                    boot += &format!("; a trial of slot {} starts at the next reboot", trial.to_uppercase());
+                }
+                let r = ui.add(egui::Label::new(RichText::new(boot).color(weak_color(ui))).truncate());
+                if trial_runs {
+                    r.on_hover_text(format!(
+                        "Slot {} runs as a trial: the camera keeps it once it has streamed video.",
+                        trial.to_uppercase()
+                    ));
+                }
+            },
+            |ui| {
+                if trial.is_empty() {
+                    return;
                 }
                 if ui
                     .add_enabled(idle, egui::Button::new("Cancel trial"))
@@ -612,85 +704,65 @@ impl App {
                 {
                     self.start(Op::Cancel, |_| xu::Camera::open()?.cancel_trial().map(|_| "trial cancelled".into()));
                 }
-            });
-        }
-        self.result(ui, Op::Reboot);
-        self.result(ui, Op::Cancel);
-        egui::CollapsingHeader::new("All fields").id_salt("camera-fields").show(ui, |ui| {
-            egui::Grid::new("camera-raw").num_columns(2).spacing([16.0, 2.0]).striped(true).show(ui, |ui| {
-                for line in info.lines() {
-                    let (k, v) = line.split_once('=').unwrap_or((line, ""));
-                    ui.label(RichText::new(k).color(weak_color(ui)));
-                    ui.monospace(v);
-                    ui.end_row();
+                if !trial_runs && ui.add_enabled(idle, egui::Button::new("Reboot into trial")).clicked() {
+                    self.start(Op::Reboot, |_| xu::Camera::open()?.reboot().map(|_| "rebooting into the trial".into()));
                 }
-            });
-            if ui.small_button("Copy").clicked() {
-                ui.ctx().copy_text(info.clone());
-            }
-        });
-    }
-
-    fn bundle_card(&mut self, ui: &mut egui::Ui, idle: bool) {
+            },
+        );
         ui.horizontal(|ui| {
             if ui.button("Choose bundle…").clicked() {
                 self.choose_bundle();
             }
             file_row(ui, self.bundle.as_ref().map(|l| l.path.as_path()), "no bundle chosen (k1cam.upd)");
         });
-        let info = match &self.cam_info {
-            Some(Ok(i)) => Some(i.clone()),
-            _ => None,
-        };
         // What is shown is what gets installed.
         let b = match self.bundle.as_ref().map(|l| &l.bundle) {
-            Some(Ok(b)) => b.clone(),
-            Some(Err(e)) => {
-                status(ui, err_color(ui), RichText::new(e).color(err_color(ui)));
-                return;
-            }
-            None => return,
+            Some(Ok(b)) => Some(b.clone()),
+            _ => None,
         };
-        ui.add_space(4.0);
-        compare(ui, info.as_deref(), &b);
-        match &b.release {
-            Some(text) => {
-                egui::CollapsingHeader::new("os-release").id_salt("os-release").show(ui, |ui| ui.monospace(text.trim_end()));
+        compare(ui, info.as_deref(), b.as_deref());
+        ui.horizontal(|ui| {
+            let release = b.as_ref().and_then(|b| b.release.clone());
+            let mut r = ui.add_enabled(release.is_some(), egui::Button::new("os-release…"));
+            if b.is_some() && release.is_none() {
+                r = r.on_disabled_hover_text("This file has no release information (packed by an older k1cam-mkupd).");
             }
-            None => {
-                ui.label(RichText::new("This file has no release information (packed by an older k1cam-mkupd).").color(weak_color(ui)));
-            }
-        }
-        ui.add_space(4.0);
-        let verdict = info.as_deref().map(|i| xu::install_slot(i, &b));
-        match &verdict {
-            Some(Ok(slot)) => {
-                status(
+            let Some(text) = release else { return };
+            egui::Popup::from_toggle_button_response(&r).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| ui.monospace(text.trim_end()));
+            });
+        });
+        let verdict = info.as_deref().zip(b.as_deref()).map(|(i, b)| xu::install_slot(i, b));
+        ui.horizontal(|ui| {
+            match (self.bundle.as_ref().map(|l| &l.bundle), &verdict) {
+                (Some(Err(e)), _) => line(ui, err_color(ui), e),
+                (_, Some(Ok(slot))) => line(
                     ui,
                     ok_color(ui),
-                    format!("The camera can install this into slot {}, then boots it as a trial.", slot.to_uppercase()),
-                );
-            }
-            Some(Err(e)) => {
-                status(ui, warn_color(ui), RichText::new(e).color(warn_color(ui)));
-            }
-            None => {}
-        }
+                    &format!("The camera can install this into slot {}, then boots it as a trial.", slot.to_uppercase()),
+                ),
+                (_, Some(Err(e))) => line(ui, warn_color(ui), e),
+                (None, _) => line(ui, weak_color(ui), "Choose a k1cam.upd to compare it with the camera"),
+                (Some(Ok(_)), None) => line(ui, weak_color(ui), "Connect to compare it with the camera"),
+            };
+        });
         ui.checkbox(&mut self.reboot_trial, "Reboot into the new slot when it is staged");
-        let label = match &verdict {
-            Some(Ok(slot)) => format!("Install to slot {}", slot.to_uppercase()),
-            _ => "Install to the inactive slot".into(),
-        };
-        let can = idle && !matches!(verdict, Some(Err(_)));
-        let mut button = egui::Button::new(RichText::new(label).strong());
-        if can {
-            button = button.fill(ui.visuals().selection.bg_fill);
-        }
-        if ui.add_enabled(can, button).clicked() {
-            let reboot = self.reboot_trial;
-            self.start(Op::Update, move |j| ops::update(j, &b, reboot));
-        }
-        self.result(ui, Op::Update);
+        ui.horizontal(|ui| {
+            let label = match &verdict {
+                Some(Ok(slot)) => format!("Install to slot {}", slot.to_uppercase()),
+                _ => "Install to the inactive slot".into(),
+            };
+            let can = idle && b.is_some() && !matches!(verdict, Some(Err(_)));
+            let mut button = egui::Button::new(RichText::new(label).strong());
+            if can {
+                button = button.fill(ui.visuals().selection.bg_fill);
+            }
+            if ui.add_enabled(can, button).clicked() {
+                let (b, reboot) = (b.clone().unwrap(), self.reboot_trial);
+                self.start(Op::Update, move |j| ops::update(j, &b, reboot));
+            }
+            self.result_line(ui, &[Op::Update, Op::Reboot, Op::Cancel], "");
+        });
     }
 
     fn help_tab(&mut self, ui: &mut egui::Ui) {
@@ -757,72 +829,170 @@ impl App {
         ui.hyperlink_to("github.com/itzexor/k1cam-flasher", "https://github.com/itzexor/k1cam-flasher");
     }
 
+    /// The log beside the tabs that run jobs: each operation under a heading
+    /// that folds, with when it started, how long it took and how it ended.
     fn log_panel(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
-        if let Some(job) = &self.job {
-            let stopping = self.cancel.load(Ordering::Relaxed);
-            ui.horizontal(|ui| {
-                let mut text = format!("{}  ·  {}", job.op.title(), clock(job.started.elapsed()));
-                if job.progress > 0.0 {
-                    text += &format!("  ·  {:.0}%", job.progress * 100.0);
-                }
-                let step = job.step.elapsed();
-                if job.progress >= 0.03 && job.progress < 1.0 && step > Duration::from_secs(3) {
-                    let left = step.mul_f32((1.0 - job.progress) / job.progress);
-                    text += &format!("  ·  about {} left", clock(left));
-                }
-                if stopping {
-                    text += "  ·  stopping";
-                }
-                let bar = egui::ProgressBar::new(job.progress).text(text).desired_width(ui.available_width() - 90.0);
-                ui.add(if job.progress == 0.0 { bar.animate(true) } else { bar });
-                if ui.add_enabled(!stopping, egui::Button::new("Cancel")).clicked() {
-                    self.cancel.store(true, Ordering::Relaxed);
-                }
-            });
-            ui.add_space(4.0);
-        }
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Log").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add_enabled(!self.busy(), egui::Button::new("Hide").small()).clicked() {
-                    self.log_open = false;
+                let fold = ui.add(egui::Button::new("").min_size(egui::vec2(20.0, 20.0)).frame_when_inactive(false));
+                chevron(ui.painter(), fold.rect.center(), egui::vec2(1.0, 0.0), ui.visuals().text_color());
+                if fold.on_hover_text("Fold the log away").clicked() {
+                    self.log_collapsed = true;
                 }
-                if ui.add_enabled(!self.log.is_empty(), egui::Button::new("Clear").small()).clicked() {
+                let any = !self.log.is_empty();
+                if ui.add_enabled(any && !self.busy(), egui::Button::new("Clear").small()).clicked() {
                     self.log.clear();
                 }
-                if ui.add_enabled(!self.log.is_empty(), egui::Button::new("Copy").small()).clicked() {
-                    let text: String = self
-                        .log
-                        .iter()
-                        .map(|l| match l.level {
-                            Level::Start => format!("--- {} ---\n", l.text),
-                            Level::Ok => format!("OK: {}\n", l.text),
-                            Level::Failed => format!("FAILED: {}\n", l.text),
-                            Level::Info => format!("{}\n", l.text),
-                        })
-                        .collect();
-                    ui.ctx().copy_text(text);
+                if ui.add_enabled(any, egui::Button::new("Save…").small()).clicked() {
+                    if let Some(path) = rfd::FileDialog::new().set_file_name(format!("k1cam-log-{}.txt", ops::stamp())).save_file() {
+                        if let Err(e) = std::fs::write(&path, self.log_text()) {
+                            self.note(Level::Failed, format!("could not save the log to {}: {e}", path.display()));
+                        }
+                    }
+                }
+                if ui.add_enabled(any, egui::Button::new("Copy").small()).clicked() {
+                    ui.ctx().copy_text(self.log_text());
                 }
             });
         });
+        ui.separator();
+        let mut toggle = None;
         egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
             if self.log.is_empty() {
                 ui.label(RichText::new("Operations and their results appear here.").color(weak_color(ui)));
             }
-            for l in &self.log {
-                let t = RichText::new(&l.text).monospace();
-                match l.level {
-                    Level::Info => ui.label(t),
-                    Level::Start => {
-                        ui.add_space(2.0);
-                        ui.label(t.strong())
-                    }
-                    Level::Ok => ui.label(t.color(ok_color(ui))),
-                    Level::Failed => ui.label(t.color(err_color(ui))),
+            let mut i = 0;
+            while i < self.log.len() {
+                let start = &self.log[i];
+                if start.level != Level::Start {
+                    // Said outside any operation.
+                    log_line(ui, start);
+                    i += 1;
+                    continue;
+                }
+                // An operation runs to its outcome, or to the end while it runs.
+                let rest = &self.log[i + 1..];
+                let end = rest.iter().position(|l| matches!(l.level, Level::Ok | Level::Failed | Level::Start));
+                let end = match end.map(|e| (e, rest[e].level)) {
+                    Some((e, Level::Start)) => i + e,
+                    Some((e, _)) => i + 1 + e,
+                    None => self.log.len() - 1,
                 };
+                let last = &self.log[end];
+                let running = end == self.log.len() - 1 && self.busy() && !matches!(last.level, Level::Ok | Level::Failed);
+                let took = if running { start.at.elapsed() } else { last.at.duration_since(start.at) };
+                if log_heading(ui, start, last.level, running, took).clicked() {
+                    toggle = Some(i);
+                }
+                if start.open {
+                    ui.indent(("log", i), |ui| self.log[i + 1..=end].iter().for_each(|l| log_line(ui, l)));
+                    ui.add_space(4.0);
+                }
+                i = end + 1;
             }
         });
+        if let Some(i) = toggle {
+            self.log[i].open = !self.log[i].open;
+        }
+    }
+
+    /// The log folded to a strip: unfolds on a click, and marks what it has not shown.
+    fn log_rail(&mut self, ui: &mut egui::Ui) {
+        let (rect, r) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
+        let color = if r.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
+        let top = rect.center_top();
+        chevron(ui.painter(), top + egui::vec2(0.0, 14.0), egui::vec2(-1.0, 0.0), color);
+        let mut y = top.y + 30.0;
+        if let Some(unread) = self.unread() {
+            badge(ui, egui::pos2(top.x, y + 8.0), unread);
+            y += 26.0;
+        }
+        // "Log" reading upwards.
+        let galley = ui.painter().layout_no_wrap("Log".into(), egui::TextStyle::Body.resolve(ui.style()), color);
+        let pos = egui::pos2(top.x - galley.size().y / 2.0, y + galley.size().x);
+        ui.painter().add(egui::epaint::TextShape::new(pos, galley, color).with_angle(-std::f32::consts::FRAC_PI_2));
+        if r.on_hover_text("Show the log").clicked() {
+            self.log_collapsed = false;
+        }
+    }
+
+    /// The open tab's device: whether it is there, what it is, and a detail.
+    fn device_status(&self) -> Option<(bool, &'static str, String)> {
+        Some(match self.tab {
+            Tab::Cloner if self.cloner_up => (true, "Camera in cloner mode", "USB a108:c309".to_string()),
+            Tab::Cloner => (false, "No camera in cloner mode", String::new()),
+            Tab::Update | Tab::Tuning if self.camera_up => {
+                let slot = match &self.cam_info {
+                    Some(Ok(i)) => xu::record_value(i, "running_slot").map(|s| format!("connected · slot {}", s.to_uppercase())),
+                    _ => None,
+                };
+                (true, "Camera running k1cam", slot.unwrap_or_else(|| "attached".into()))
+            }
+            Tab::Update | Tab::Tuning => (false, "No camera running k1cam", String::new()),
+            Tab::Console if self.console.connected() => (true, "Console connected", String::new()),
+            Tab::Console => (false, "Console not connected", String::new()),
+            Tab::Help => return None,
+        })
+    }
+
+    /// The tint behind the status bar: blue while a job runs, green while the
+    /// open tab's device is there, grey otherwise.
+    fn status_fill(&self, ui: &egui::Ui) -> Color32 {
+        let base = ui.visuals().panel_fill;
+        match (self.busy(), self.device_status()) {
+            (true, _) => base.lerp_to_gamma(ui.visuals().selection.bg_fill, 0.45),
+            (false, Some((true, ..))) => base.lerp_to_gamma(ok_color(ui), 0.16),
+            _ => base.lerp_to_gamma(ui.visuals().text_color(), 0.08),
+        }
+    }
+
+    /// The open tab's device on the left; the running job on the right.
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let (weak, strong) = (weak_color(ui), ui.visuals().strong_text_color());
+        let device = self.device_status();
+        egui::Sides::new().height(26.0).shrink_right().show(
+            ui,
+            |ui| {
+                let Some((up, text, detail)) = device else { return };
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 5.0, if up { ok_color(ui) } else { weak });
+                ui.label(RichText::new(text).size(16.0).color(strong));
+                ui.label(RichText::new(detail).color(weak));
+            },
+            |ui| {
+                let Some(job) = &self.job else { return };
+                let stopping = self.cancel.load(Ordering::Relaxed);
+                if ui.add_enabled(!stopping, egui::Button::new("Cancel")).clicked() {
+                    self.cancel.store(true, Ordering::Relaxed);
+                }
+                let mut time = clock(job.started.elapsed());
+                let step = job.step.elapsed();
+                if job.progress >= 0.03 && job.progress < 1.0 && step > Duration::from_secs(3) {
+                    time += &format!(" · about {} left", clock(step.mul_f32((1.0 - job.progress) / job.progress)));
+                }
+                ui.label(RichText::new(time).color(weak));
+                ui.separator();
+                if job.progress > 0.0 {
+                    ui.label(RichText::new(format!("{:.0}%", job.progress * 100.0)).size(16.0).color(strong));
+                }
+                let bar = egui::ProgressBar::new(job.progress).desired_width(220.0).desired_height(10.0);
+                ui.add(if job.progress == 0.0 { bar.animate(true) } else { bar });
+                // The job's name, then what it said last.
+                let said = match self.log.last() {
+                    _ if stopping => "stopping",
+                    Some(l) if l.level == Level::Info => l.text.as_str(),
+                    _ => "",
+                };
+                let mut text = egui::text::LayoutJob::default();
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                text.append(job.op.title(), 0.0, egui::TextFormat::simple(egui::FontId::proportional(16.0), strong));
+                text.append(said, 10.0, egui::TextFormat::simple(font, weak));
+                ui.add(egui::Label::new(text).truncate());
+            },
+        );
     }
 
     /// Files dropped on the window: a .upd for the A/B tab, a .bin to flash.
@@ -884,82 +1054,141 @@ impl App {
     }
 }
 
-/// The two slots and what each is to the camera.
+/// The two slots and what each is to the camera, in the caller's row.
 fn slots(ui: &mut egui::Ui, info: &str) {
     let get = |k| xu::record_value(info, k).unwrap_or("");
-    ui.horizontal(|ui| {
-        for s in ["a", "b"] {
-            let mut tags = Vec::new();
-            if get("running_slot") == s {
-                tags.push("running");
-            }
-            if get("active_slot") == s {
-                tags.push("confirmed");
-            }
-            if get("trial_slot") == s {
-                tags.push("trial");
-            }
-            let running = get("running_slot") == s;
-            let stroke = if running { egui::Stroke::new(1.5, ok_color(ui)) } else { ui.visuals().widgets.noninteractive.bg_stroke };
-            egui::Frame::new().stroke(stroke).corner_radius(4.0).inner_margin(egui::Margin::symmetric(8, 2)).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Slot {}", s.to_uppercase())).strong());
-                    let tags = if tags.is_empty() { "inactive".to_string() } else { tags.join(", ") };
-                    ui.label(RichText::new(tags).color(weak_color(ui)));
-                });
-            });
+    for s in ["a", "b"] {
+        let mut tags = Vec::new();
+        if get("running_slot") == s {
+            tags.push("running");
         }
-    });
+        if get("active_slot") == s {
+            tags.push("confirmed");
+        }
+        if get("trial_slot") == s {
+            tags.push("trial");
+        }
+        let running = get("running_slot") == s;
+        let stroke = if running { egui::Stroke::new(1.5, ok_color(ui)) } else { ui.visuals().widgets.noninteractive.bg_stroke };
+        egui::Frame::new().stroke(stroke).corner_radius(4.0).inner_margin(egui::Margin::symmetric(8, 2)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Slot {}", s.to_uppercase())).strong());
+                let tags = if tags.is_empty() { "inactive".to_string() } else { tags.join(", ") };
+                ui.label(RichText::new(tags).color(weak_color(ui)));
+            });
+        });
+    }
 }
 
 /// The camera next to the bundle, with what would stop the camera taking it
-/// marked (xu::install_slot has the final word).
-fn compare(ui: &mut egui::Ui, info: Option<&str>, b: &bundle::Bundle) {
+/// marked (xu::install_slot has the final word). Every row is there before
+/// either is known, so that neither moves what follows.
+fn compare(ui: &mut egui::Ui, info: Option<&str>, b: Option<&bundle::Bundle>) {
     let (ok, bad, weak) = (ok_color(ui), err_color(ui), weak_color(ui));
     let cam = |k: &str| info.and_then(|i| xu::record_value(i, k)).unwrap_or("");
+    let release = |k: &str| b.and_then(|b| b.release_value(k)).unwrap_or("");
     let mono = |s: &str| if s.is_empty() { RichText::new("—").color(weak) } else { RichText::new(s).monospace() };
     let mark = |t: RichText, good: bool| if info.is_none() { t } else { t.color(if good { ok } else { bad }) };
     egui::Grid::new("compare").num_columns(3).spacing([16.0, 4.0]).striped(true).show(ui, |ui| {
         let row = |ui: &mut egui::Ui, label: &str, cam: RichText, bundle: RichText| {
             ui.label(label);
-            if info.is_some() {
-                ui.label(cam);
-            }
+            ui.label(cam);
             ui.label(bundle);
             ui.end_row();
         };
         row(ui, "", RichText::new("Camera").color(weak), RichText::new("This bundle").color(weak));
-        let build = mono(&b.build);
-        row(ui, "Build", mono(cam("build")), if cam("build") == b.build { build.color(weak) } else { build });
-        if let Some(c) = b.release_value("COMMIT_ID") {
-            row(ui, "Commit", mono(""), mono(c));
-        }
-        let kernel: String = b.release_value("KERNEL_COMMIT").unwrap_or("").chars().take(12).collect();
+        let build = match b {
+            Some(b) if b.build == cam("build") => mono(&b.build).color(weak),
+            Some(b) => mono(&b.build),
+            None => RichText::new("choose a bundle…").color(weak),
+        };
+        row(ui, "Build", mono(cam("build")), build);
+        row(ui, "Commit", mono(""), mono(release("COMMIT_ID")));
+        let kernel: String = release("KERNEL_COMMIT").chars().take(12).collect();
         row(ui, "Kernel", mono(cam("kernel")), mono(&kernel));
-        if let Some(v) = b.release_value("BUILDROOT_VERSION") {
-            row(ui, "Buildroot", mono(""), mono(v));
-        }
-        row(ui, "Board", mono(cam("board")), mark(mono(&b.board), cam("board") == b.board));
-        row(ui, "Layout", mono(cam("layout")), mark(mono(&b.layout), cam("layout") == b.layout));
+        row(ui, "Buildroot", mono(""), mono(release("BUILDROOT_VERSION")));
+        row(ui, "Board", mono(cam("board")), b.map_or(mono(""), |b| mark(mono(&b.board), cam("board") == b.board)));
+        row(ui, "Layout", mono(cam("layout")), b.map_or(mono(""), |b| mark(mono(&b.layout), cam("layout") == b.layout)));
         let compat = cam("boot_compat").parse::<u32>().unwrap_or(0);
-        row(
-            ui,
-            "Boot compat",
-            RichText::new(cam("boot_compat")),
-            mark(RichText::new(format!("needs {}", b.min_boot)), b.min_boot <= compat),
-        );
-        for (label, len, key) in [("Kernel", b.kernel_len as u64, "kernel_capacity"), ("Rootfs", b.rootfs_len as u64, "rootfs_capacity")] {
+        let needs = b.map_or(mono(""), |b| mark(RichText::new(format!("needs {}", b.min_boot)), b.min_boot <= compat));
+        row(ui, "Boot compat", mono(cam("boot_compat")), needs);
+        let sizes =
+            [("Kernel", b.map(|b| b.kernel_len as u64), "kernel_capacity"), ("Rootfs", b.map(|b| b.rootfs_len as u64), "rootfs_capacity")];
+        for (label, len, key) in sizes {
             let cap = cam(key).parse::<u64>().unwrap_or(0);
-            let (slot, size) = match cap {
-                0 => (RichText::new("—").color(weak), RichText::new(bytes(len))),
-                _ => (
-                    RichText::new(format!("{} slot", bytes(cap))),
-                    mark(RichText::new(format!("{} ({}%)", bytes(len), len * 100 / cap)), len <= cap),
-                ),
+            let slot = if cap == 0 { mono("") } else { RichText::new(format!("{} slot", bytes(cap))) };
+            let size = match (len, cap) {
+                (None, _) => mono(""),
+                (Some(len), 0) => RichText::new(bytes(len)),
+                (Some(len), cap) => mark(RichText::new(format!("{} ({}%)", bytes(len), len * 100 / cap)), len <= cap),
             };
             row(ui, &format!("{label} size"), slot, size);
         }
     });
+}
+
+/// Help, made easy to find: a filled circle with a question mark, painted.
+fn help_button(ui: &mut egui::Ui, selected: bool) -> bool {
+    let icon = egui::IdSalt::new("help-icon");
+    let mut atoms = egui::Atoms::new("Help");
+    atoms.push_left(egui::Atom::custom(icon, egui::vec2(16.0, 16.0)));
+    let accent = ui.visuals().hyperlink_color;
+    // The ring is painted over the button: a stroke given to the button would
+    // undo the style's padding compensation and resize it on hover.
+    let r = egui::Button::new(atoms).selected(selected).corner_radius(12.0).atom_ui(ui);
+    let painter = ui.painter();
+    if !selected && !r.response.hovered() {
+        painter.rect_stroke(r.response.rect, 12.0, egui::Stroke::new(1.0, accent.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+    }
+    if let Some(rect) = r.rect(icon) {
+        painter.circle_filled(rect.center(), 8.0, accent);
+        let font = egui::FontId::proportional(13.0);
+        painter.text(rect.center() + egui::vec2(0.0, 0.5), egui::Align2::CENTER_CENTER, "?", font, ui.visuals().panel_fill);
+    }
+    r.response.on_hover_text("Help: cloner mode, drivers, about").clicked()
+}
+
+/// One line of the log, timed.
+fn log_line(ui: &mut egui::Ui, l: &Line) {
+    ui.horizontal_top(|ui| {
+        ui.label(RichText::new(&l.time).monospace().color(weak_color(ui)));
+        let t = RichText::new(&l.text).monospace();
+        let t = match l.level {
+            Level::Ok => t.color(ok_color(ui)),
+            Level::Failed => t.color(err_color(ui)),
+            _ => t,
+        };
+        ui.add(egui::Label::new(t).wrap());
+    });
+}
+
+/// An operation's heading in the log: folds its lines, and says how it went.
+fn log_heading(ui: &mut egui::Ui, start: &Line, end: Level, running: bool, took: Duration) -> egui::Response {
+    let height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
+    let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click());
+    let painter = ui.painter();
+    if r.hovered() {
+        painter.rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let y = rect.center().y;
+    let dir = if start.open { egui::vec2(0.0, 1.0) } else { egui::vec2(1.0, 0.0) };
+    chevron(painter, egui::pos2(rect.left() + 8.0, y), dir, weak_color(ui));
+    let mark = egui::Rect::from_center_size(egui::pos2(rect.left() + 24.0, y), egui::vec2(10.0, 10.0));
+    if running {
+        egui::Spinner::new().size(10.0).paint_at(ui, mark);
+    } else {
+        let color = match end {
+            Level::Ok => ok_color(ui),
+            Level::Failed => err_color(ui),
+            _ => weak_color(ui),
+        };
+        painter.circle_filled(mark.center(), 4.0, color);
+    }
+    let meta = format!("{} · {}", start.time, clock(took));
+    painter.text(egui::pos2(rect.right() - 6.0, y), egui::Align2::RIGHT_CENTER, meta, egui::FontId::proportional(12.0), weak_color(ui));
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    painter.text(egui::pos2(rect.left() + 36.0, y), egui::Align2::LEFT_CENTER, &start.text, font, ui.visuals().strong_text_color());
+    r
 }
 
 impl eframe::App for App {
@@ -1006,34 +1235,16 @@ impl eframe::App for App {
         self.take_dropped(&ctx);
         self.guard_close(&ctx);
 
+        // The tabs stay open during a job: the status bar follows it from any of them.
         egui::Panel::top("tabs").show(ui, |ui| {
-            if self.busy() {
-                ui.disable();
-            }
             ui.add_space(6.0);
-            let (cloner, camera, console) = (self.cloner_up, self.camera_up, self.console.connected());
             let tab = self.tab;
-            // The log's button counts the lines not seen yet, in red if one failed.
-            let unseen = &self.log[self.log_seen.min(self.log.len())..];
-            let mut log = RichText::new(if unseen.is_empty() { "Log".to_string() } else { format!("Log ({})", unseen.len()) });
-            if unseen.iter().any(|l| l.level == Level::Failed) {
-                log = log.color(err_color(ui));
-            }
-            let log_open = self.log_open;
-            let (left, (right, toggle_log)) = egui::Sides::new().show(
+            let (left, right) = egui::Sides::new().show(
                 ui,
                 |ui| {
                     let mut pick = None;
-                    let mut item = |ui: &mut egui::Ui, t: Tab, label: &str, up: bool, tip: &str| {
-                        let dot = egui::IdSalt::new(("tab-dot", label));
-                        let mut atoms = egui::Atoms::new(label);
-                        atoms.push_left(egui::Atom::custom(dot, egui::vec2(8.0, 8.0)));
-                        let r = egui::Button::selectable(tab == t, atoms).atom_ui(ui);
-                        if let Some(rect) = r.rect(dot) {
-                            let color = if up { ok_color(ui) } else { weak_color(ui) };
-                            ui.painter().circle_filled(rect.center(), 3.5, color);
-                        }
-                        if r.response.on_hover_text(tip).clicked() {
+                    let mut item = |ui: &mut egui::Ui, t: Tab, label: &str, tip: &str| {
+                        if ui.add(egui::Button::selectable(tab == t, label)).on_hover_text(tip).clicked() {
                             pick = Some(t);
                         }
                     };
@@ -1041,47 +1252,48 @@ impl eframe::App for App {
                         ui,
                         Tab::Cloner,
                         "Backup & Flash",
-                        cloner,
-                        if cloner { "A camera in cloner mode is attached" } else { "No camera in cloner mode" },
+                        "The whole 8 MiB flash, through the Ingenic boot ROM's USB mode (cloner): for installing k1cam once, \
+                         and for a camera that no longer boots.",
                     );
                     item(
                         ui,
                         Tab::Update,
                         "A/B Update",
-                        camera,
-                        if camera { "A camera running k1cam is attached" } else { "No camera running k1cam" },
+                        "Updates a camera running k1cam firmware over USB. The update goes into the slot it isn't running and \
+                         boots as a trial: the camera keeps it once it works, and goes back to the old one by itself otherwise.",
                     );
-                    item(ui, Tab::Tuning, "Tuning", camera, "The live picture and the camera's image controls");
+                    item(ui, Tab::Tuning, "Tuning", "The live picture and the camera's image controls");
                     // Port discovery makes the tab available without opening the port.
                     if self.console.seen() {
-                        item(
-                            ui,
-                            Tab::Console,
-                            "Console",
-                            console,
-                            if console { "Connected to the camera's console" } else { "Not connected" },
-                        );
+                        item(ui, Tab::Console, "Console", "The camera's serial console");
                     }
                     pick
                 },
-                |ui| {
-                    let help = egui::Button::selectable(tab == Tab::Help, RichText::new(" ? ").strong());
-                    let help = ui.add(help).on_hover_text("Help: cloner mode, drivers, about").clicked().then_some(Tab::Help);
-                    let log = ui.add(egui::Button::selectable(log_open, log)).on_hover_text("Operations and their results");
-                    (help, log.clicked())
-                },
+                |ui| help_button(ui, tab == Tab::Help).then_some(Tab::Help),
             );
             if let Some(t) = left.or(right) {
                 self.tab = t;
             }
-            if toggle_log {
-                self.log_open = !self.log_open;
-            }
             ui.add_space(4.0);
         });
-        if self.log_open || self.busy() {
-            egui::Panel::bottom("log").resizable(true).default_size(120.0).min_size(70.0).show(ui, |ui| self.log_panel(ui));
-            self.log_seen = self.log.len();
+        // Right under the tabs, where it is seen; Help has no device.
+        if self.busy() || self.tab != Tab::Help {
+            let frame = egui::Frame::new().fill(self.status_fill(ui)).inner_margin(egui::Margin::symmetric(10, 6));
+            egui::Panel::top("status").frame(frame).show(ui, |ui| self.status_bar(ui));
+        }
+        // The log sits beside the tabs that run jobs.
+        if matches!(self.tab, Tab::Cloner | Tab::Update) {
+            if self.log_collapsed {
+                egui::Panel::right("log-rail").resizable(false).exact_size(30.0).show(ui, |ui| self.log_rail(ui));
+            } else {
+                egui::Panel::right("log")
+                    .resizable(true)
+                    .default_size(380.0)
+                    .min_size(260.0)
+                    .max_size(720.0)
+                    .show(ui, |ui| self.log_panel(ui));
+                self.log_seen = self.log.len();
+            }
         }
         egui::CentralPanel::default().show(ui, |ui| {
             if self.busy() {
@@ -1189,8 +1401,8 @@ mod tests {
 pub fn run(args: &[String]) -> eframe::Result {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 720.0])
-            .with_min_inner_size([640.0, 480.0])
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([800.0, 560.0])
             .with_title("k1cam flasher"),
         ..Default::default()
     };
