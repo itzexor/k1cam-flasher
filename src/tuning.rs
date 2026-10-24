@@ -547,8 +547,9 @@ fn flow(lines: &[Line], cols: &[egui::Rect], line: f32, run_on: bool) -> Option<
 
 /// The preview at the top left, as large as it can be with every control in
 /// view, and the controls flowing past it the way a page wraps text around a
-/// picture: down the columns of a box beside it, then of a box below it. Only
-/// when they don't fit beside a preview `SMALLEST` wide does the tab scroll.
+/// picture: down the columns of a box beside it, as tall as the picture, then
+/// of a box across the room below it, so that they read in order. Only when
+/// they don't fit beside a preview `SMALLEST` wide does the tab scroll.
 fn arrange(room: egui::Vec2, aspect: f32, lines: &[Line], line: f32) -> Arrangement {
     let (w, h, aspect) = (room.x.max(1.0), room.y.max(1.0), aspect.max(0.1));
     let largest = w.min(h * aspect).floor().max(1.0);
@@ -566,22 +567,22 @@ fn arrange(room: egui::Vec2, aspect: f32, lines: &[Line], line: f32) -> Arrangem
 /// The arrangement with a preview `pw` by `ph`, if the lines fit (or anyway,
 /// with `run_on`).
 fn place(w: f32, h: f32, pw: f32, ph: f32, lines: &[Line], line: f32, run_on: bool) -> Option<Arrangement> {
-    let side = fit(w - pw - GAP);
-    let beside = egui::Rect::from_min_max(egui::pos2(pw + GAP, 0.0), egui::pos2(w, h));
-    let below = egui::Rect::from_min_max(egui::pos2(0.0, ph + GAP), egui::pos2(if side == 0 { w } else { pw }, h));
-    let under = if side == 0 { fit(w).max(1) } else { fit(pw) };
-    let mut cols = columns(beside, side);
+    // Beside the picture only as far down as it goes, so that nothing beside it
+    // comes after what starts below it.
+    let beside = egui::Rect::from_min_max(egui::pos2(pw + GAP, 0.0), egui::pos2(w, ph.min(h)));
+    let below = egui::Rect::from_min_max(egui::pos2(0.0, ph + GAP), egui::pos2(w, h));
+    let mut cols = columns(beside, fit(beside.width()));
     let split = cols.len();
-    cols.extend(columns(below, under));
+    cols.extend(columns(below, fit(w).max(1)));
     let placed = flow(lines, &cols, line, run_on)?;
-    // The boxes in use, as tall as the room or the lines run on, and as wide as
-    // their columns in use.
+    // The boxes in use, as wide as their columns in use; the one below as tall
+    // as the room or the lines run on.
     let end = placed.iter().map(|(_, p)| p.rect.bottom() + PAD).fold(h, f32::max);
     let used = |c: usize| placed.iter().any(|(at, _)| *at == c);
     let (mut boxes, mut rules) = (Vec::new(), Vec::new());
-    for (b, range) in [(beside, 0..split), (below, split..cols.len())] {
+    for (b, range, bottom) in [(beside, 0..split, beside.bottom()), (below, split..cols.len(), end)] {
         let Some(last) = range.clone().rev().find(|&c| used(c)) else { continue };
-        let b = egui::Rect::from_min_max(b.min, egui::pos2(cols[last].right() + PAD, end));
+        let b = egui::Rect::from_min_max(b.min, egui::pos2(cols[last].right() + PAD, bottom));
         for c in range.skip(1).filter(|c| used(*c)) {
             let x = cols[c].left() - RULE / 2.0;
             rules.push([egui::pos2(x, b.top() + PAD), egui::pos2(x, b.bottom() - PAD)]);
@@ -1426,6 +1427,11 @@ mod tests {
         assert!(p.min == egui::Pos2::ZERO && (p.width() / p.height() - aspect).abs() < 1e-3, "{p:?}");
         let order: Vec<usize> = a.lines.iter().filter_map(|l| l.line).collect();
         assert_eq!(order, (0..lines.len()).collect::<Vec<_>>());
+        // They read in order: a line left of the one before it is below it.
+        for w in a.lines.windows(2) {
+            let (r, n) = (w[0].rect, w[1].rect);
+            assert!(n.left() >= r.left() || n.top() >= r.bottom(), "{n:?} after {r:?} in {room:?}");
+        }
         for (k, l) in a.lines.iter().enumerate() {
             let r = l.rect;
             assert!(r.left() >= 0.0 && r.right() <= room.x + 1e-3, "{r:?} outside {room:?}");
@@ -1483,8 +1489,8 @@ mod tests {
 
     #[test]
     fn the_controls_wrap_around_the_preview_and_fit() {
-        // The tab in the default 1100x720 window, and in a 1145x842 one.
-        for room in [egui::vec2(1084.0, 648.0), egui::vec2(1129.0, 760.0)] {
+        // The tab in the default 1280x800 window, and in 1100x720 and 1145x842 ones.
+        for room in [egui::vec2(1264.0, 682.0), egui::vec2(1084.0, 648.0), egui::vec2(1129.0, 760.0)] {
             let lines = real();
             let a = arrange(room, WIDE, &lines, LINE);
             sound(room, WIDE, &lines, &a);
