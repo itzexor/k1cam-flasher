@@ -227,8 +227,6 @@ fn run_port(name: String, out: Receiver<Vec<u8>>, tx: Sender<Msg>, stop: Arc<Ato
 }
 
 pub struct Console {
-    /// The camera's console port has been seen: the tab exists from then on.
-    seen: bool,
     port: Option<String>,
     conn: Option<Conn>,
     /// The old port must finish closing before another connection or a job.
@@ -252,11 +250,10 @@ fn find_port() -> Option<String> {
 impl Console {
     pub fn new() -> Self {
         Self {
-            seen: false,
             port: None,
             conn: None,
             closing: None,
-            note: "Connect to open the camera's console".into(),
+            note: "Waiting for the camera's console".into(),
             term: Term::new(),
             input: String::new(),
             history: Vec::new(),
@@ -265,8 +262,9 @@ impl Console {
         }
     }
 
-    pub fn seen(&self) -> bool {
-        self.seen
+    /// The camera's console port is there, open or not.
+    pub fn found(&self) -> bool {
+        self.port.is_some()
     }
 
     pub fn connected(&self) -> bool {
@@ -327,13 +325,12 @@ impl Console {
             if self.conn.as_ref().is_some_and(|c| Some(&c.name) != found.as_ref()) {
                 self.disconnect();
             }
-            if found.is_none() && self.seen {
+            if found.is_none() {
                 self.note = "Waiting for the camera's console".into();
+            } else if self.conn.is_none() {
+                self.note = "Connect to open the camera's console".into();
             }
             self.port = found;
-        }
-        if self.port.is_some() {
-            self.seen = true;
         }
     }
 
@@ -372,8 +369,11 @@ impl Console {
                 if ui.button("Disconnect").clicked() {
                     self.disconnect();
                 }
-            } else if let Some(name) = self.port.clone() {
-                if ui.add_enabled(self.closing.is_none(), egui::Button::new("Connect")).clicked() {
+            } else {
+                // There before the port is, so that the tab looks the same either way.
+                let r = ui.add_enabled(self.port.is_some() && self.closing.is_none(), egui::Button::new("Connect"));
+                let r = r.on_disabled_hover_text("No camera console is attached");
+                if let Some(name) = self.port.clone().filter(|_| r.clicked()) {
                     self.connect(&name, ui.ctx());
                 }
             }

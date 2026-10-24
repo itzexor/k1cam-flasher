@@ -933,7 +933,8 @@ impl App {
             }
             Tab::Update | Tab::Tuning => (false, "No camera running k1cam", String::new()),
             Tab::Console if self.console.connected() => (true, "Console connected", String::new()),
-            Tab::Console => (false, "Console not connected", String::new()),
+            Tab::Console if self.console.found() => (false, "Console found, not connected", String::new()),
+            Tab::Console => (false, "No camera console found", String::new()),
             Tab::Help => return None,
         })
     }
@@ -1263,10 +1264,7 @@ impl eframe::App for App {
                          boots as a trial: the camera keeps it once it works, and goes back to the old one by itself otherwise.",
                     );
                     item(ui, Tab::Tuning, "Tuning", "The live picture and the camera's image controls");
-                    // Port discovery makes the tab available without opening the port.
-                    if self.console.seen() {
-                        item(ui, Tab::Console, "Console", "The camera's serial console");
-                    }
+                    item(ui, Tab::Console, "Console", "The camera's serial console");
                     pick
                 },
                 |ui| help_button(ui, tab == Tab::Help).then_some(Tab::Help),
