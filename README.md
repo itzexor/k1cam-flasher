@@ -16,6 +16,22 @@ The status bar under the tabs shows whether the open tab's device is attached (g
 
 > Take and check a backup before relying on it.
 
+## Download
+
+The newest build of `main`, replaced on every push, is the [nightly release](https://github.com/itzexor/k1cam-flasher/releases/tag/nightly):
+
+| Platform | GUI | Command line (static) |
+|---|---|---|
+| Linux x86_64 | [k1cam-flasher-linux-x86_64](https://github.com/itzexor/k1cam-flasher/releases/download/nightly/k1cam-flasher-linux-x86_64) | [k1cam-flasher-cli-linux-x86_64](https://github.com/itzexor/k1cam-flasher/releases/download/nightly/k1cam-flasher-cli-linux-x86_64) |
+| Linux aarch64 (64-bit Raspberry Pi OS) | | [k1cam-flasher-cli-linux-aarch64](https://github.com/itzexor/k1cam-flasher/releases/download/nightly/k1cam-flasher-cli-linux-aarch64) |
+| Linux armv7 (32-bit Raspberry Pi OS) | | [k1cam-flasher-cli-linux-armv7](https://github.com/itzexor/k1cam-flasher/releases/download/nightly/k1cam-flasher-cli-linux-armv7) |
+| Linux armv6 (Pi Zero, Pi 1) | | [k1cam-flasher-cli-linux-armv6](https://github.com/itzexor/k1cam-flasher/releases/download/nightly/k1cam-flasher-cli-linux-armv6) |
+| Windows x86_64 | [k1cam-flasher-windows-x86_64.exe](https://github.com/itzexor/k1cam-flasher/releases/download/nightly/k1cam-flasher-windows-x86_64.exe) | |
+| macOS Apple Silicon | [k1cam-flasher-macos-arm64](https://github.com/itzexor/k1cam-flasher/releases/download/nightly/k1cam-flasher-macos-arm64) | |
+| macOS Intel | [k1cam-flasher-macos-x86_64](https://github.com/itzexor/k1cam-flasher/releases/download/nightly/k1cam-flasher-macos-x86_64) | |
+
+[SHA256SUMS](https://github.com/itzexor/k1cam-flasher/releases/download/nightly/SHA256SUMS) has their checksums. On Linux and macOS, `chmod +x` the file; macOS also wants `xattr -d com.apple.quarantine` on it before it runs.
+
 ## Getting the camera into USB boot mode
 
 The bootrom only listens on USB when the SoC cannot boot from the NOR, so you short two NOR pins while it powers up.

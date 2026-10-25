@@ -40,3 +40,53 @@ jobs:
         with:
           name: k1cam-flasher-headless-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/k1cam-flasher
+  # Every push to main replaces the files of one prerelease, "nightly", and
+  # moves its tag, so releases/download/nightly/<file> is always the newest
+  # build: no login, no zip, no expiry.
+  nightly:
+    if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+    needs: [build, headless]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency: nightly
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SUBJECT: ${{ github.event.head_commit.message }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Name the binaries
+        run: |
+          mkdir dist
+          a=artifacts/k1cam-flasher
+          cp $a-ubuntu-latest/k1cam-flasher dist/k1cam-flasher-linux-x86_64
+          cp $a-windows-latest/k1cam-flasher.exe dist/k1cam-flasher-windows-x86_64.exe
+          cp $a-macos-latest/k1cam-flasher dist/k1cam-flasher-macos-arm64
+          cp $a-macos-x86_64/k1cam-flasher dist/k1cam-flasher-macos-x86_64
+          cp $a-headless-x86_64-unknown-linux-musl/k1cam-flasher dist/k1cam-flasher-cli-linux-x86_64
+          cp $a-headless-aarch64-unknown-linux-musl/k1cam-flasher dist/k1cam-flasher-cli-linux-aarch64
+          cp $a-headless-armv7-unknown-linux-musleabihf/k1cam-flasher dist/k1cam-flasher-cli-linux-armv7
+          cp $a-headless-arm-unknown-linux-musleabihf/k1cam-flasher dist/k1cam-flasher-cli-linux-armv6
+          (cd dist && sha256sum * >SHA256SUMS)
+      - name: Publish
+        run: |
+          # A run that finishes after a newer commit's leaves nightly alone.
+          head=$(gh api "repos/$GH_REPO/commits/$GITHUB_REF_NAME" --jq .sha)
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "$GITHUB_REF_NAME is at $head now, not $GITHUB_SHA: skipping"
+            exit 0
+          fi
+          notes="Built from [${GITHUB_SHA::7}]($GITHUB_SERVER_URL/$GH_REPO/commit/$GITHUB_SHA): ${SUBJECT%%$'\n'*}
+
+          Replaced on every push to $GITHUB_REF_NAME. Downloaded binaries need \`chmod +x\`."
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release upload nightly dist/* --clobber
+          else
+            gh release create nightly dist/* --prerelease --title nightly --target "$GITHUB_SHA" --notes "$notes"
+          fi
+          gh api -X PATCH "repos/$GH_REPO/git/refs/tags/nightly" -f sha="$GITHUB_SHA" -F force=true >/dev/null ||
+            gh api "repos/$GH_REPO/git/refs" -f ref=refs/tags/nightly -f sha="$GITHUB_SHA" >/dev/null
+          gh release edit nightly --notes "$notes"
