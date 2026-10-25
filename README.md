@@ -14,7 +14,7 @@ The status bar under the tabs shows whether the open tab's device is attached (g
 |---|---|---|---|
 | ![Backup & Flash tab](docs/screenshot-cloner.png) | ![A/B Update tab](docs/screenshot-update.png) | ![Tuning tab](docs/screenshot-tuning.png) | ![Help tab](docs/screenshot-help.png) |
 
-> Not yet tested against real hardware. Take and check a backup before relying on it.
+> Take and check a backup before relying on it.
 
 ## Getting the camera into USB boot mode
 
