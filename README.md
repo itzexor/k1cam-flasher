@@ -86,11 +86,11 @@ cargo build --release --no-default-features --target aarch64-unknown-linux-musl
 # -> target/aarch64-unknown-linux-musl/release/k1cam-flasher (static)
 ```
 
-The same works for `x86_64-unknown-linux-musl` and `armv7-unknown-linux-musleabihf` (32-bit Raspberry Pi OS); CI builds all three. On the target it needs access to `/dev/video*` (A/B) and `/dev/bus/usb` (cloner), e.g. as root or with the udev rule. MIPS boards are a tier 3 Rust target: nightly Rust with `-Z build-std=std,panic_abort --target mipsel-unknown-linux-musl` and a musl cross gcc as the linker (untested).
+The same works for `x86_64-unknown-linux-musl`, `armv7-unknown-linux-musleabihf` (32-bit Raspberry Pi OS) and `arm-unknown-linux-musleabihf` (ARMv6: Pi Zero, Pi 1); CI builds all four. On the target it needs access to `/dev/video*` (A/B) and `/dev/bus/usb` (cloner), e.g. as root or with the udev rule. MIPS boards are a tier 3 Rust target: nightly Rust with `-Z build-std=std,panic_abort --target mipsel-unknown-linux-musl` and a musl cross gcc as the linker (untested).
 
 ## Build
 
-`cargo build --release` builds the GUI. It needs a C toolchain (for a Wayland build script on Linux, and libusb, which is vendored, on Windows and macOS); on Linux the build needs no extra GUI libraries beyond the usual X11/Wayland ones at runtime. CI in `.github/workflows/build.yml` builds the GUI on all three OSes and the static command-line binaries.
+`cargo build --release` builds the GUI. It needs a C toolchain (for a Wayland build script on Linux, and libusb, which is vendored, on Windows and macOS); on Linux the build needs no extra GUI libraries beyond the usual X11/Wayland ones at runtime. CI in `.github/workflows/build.yml` builds the GUI on all three OSes (macOS for both Apple Silicon and Intel) and the static command-line binaries.
 
 ## Embedded cloner data
 
