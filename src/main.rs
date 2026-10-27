@@ -2,6 +2,7 @@
 mod bundle;
 mod cli;
 mod cloner;
+mod controls;
 #[cfg(feature = "gui")]
 mod console;
 #[cfg(feature = "gui")]
@@ -15,7 +16,7 @@ mod overlay;
 #[cfg(feature = "gui")]
 mod tuning;
 mod usb;
-#[cfg(all(feature = "gui", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 mod v4l2;
 mod xu;
 

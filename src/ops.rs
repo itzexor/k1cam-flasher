@@ -39,14 +39,25 @@ pub fn flash(j: &Job, image: &Path, backup_first: bool, verify: bool, reboot: bo
     if data.len() != FLASH_SIZE {
         return Err(format!("{} must be exactly 8 MiB (got {} bytes)", image.display(), data.len()));
     }
-    if backup_first {
+    let backup = backup_first.then(|| {
         let mut name = image.file_stem().unwrap_or_default().to_os_string();
         name.push(format!("-backup-{}.bin", stamp()));
-        let path = image.with_file_name(name);
-        j.log("Backing up the current flash first");
-        j.log(backup(j, &path)?);
+        image.with_file_name(name)
+    });
+    flash_data(j, &data, backup.as_deref(), verify, reboot)
+}
+
+/// Writes `data`, a whole-flash image, with the cloner; backs the flash up to
+/// `backup` first. The daemon's uploads arrive this way, never as files.
+pub fn flash_data(j: &Job, data: &[u8], backup: Option<&Path>, verify: bool, reboot: bool) -> Result<String, String> {
+    if data.len() != FLASH_SIZE {
+        return Err(format!("a whole-flash image is exactly 8 MiB (got {} bytes)", data.len()));
     }
-    cloner::Cloner::write_flash(j, &data, false)?;
+    if let Some(path) = backup {
+        j.log("Backing up the current flash first");
+        j.log(self::backup(j, path)?);
+    }
+    cloner::Cloner::write_flash(j, data, false)?;
     if verify {
         j.log("Verifying");
         let back = cloner::Cloner::read_flash(j)?;

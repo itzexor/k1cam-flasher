@@ -13,6 +13,7 @@ gui = ["dep:eframe", "dep:egui_extras", "dep:image", "dep:rfd", "dep:serialport"
 [dependencies]
 sha2 = "0.10"
 crc32fast = "1"
+serde = { version = "1", features = ["derive"] }
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"], optional = true }
 egui_extras = { version = "0.37", features = ["image"], optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg"], optional = true }

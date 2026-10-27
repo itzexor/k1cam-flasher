@@ -1555,6 +1555,7 @@ dependencies = [
  "libc",
  "rfd",
  "rusb",
+ "serde",
  "serialport",
  "sha2",
 ]

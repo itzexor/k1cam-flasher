@@ -197,7 +197,6 @@ impl UsbDevice {
 /// The capture node of an attached camera with one of these ids (its uvcvideo
 /// node with index 0; the other is for metadata), found in sysfs, so a camera
 /// that has stopped answering isn't asked.
-#[cfg(feature = "gui")]
 pub fn video_node(ids: &[(u16, u16)]) -> Option<PathBuf> {
     for e in std::fs::read_dir("/sys/class/video4linux").ok()?.flatten() {
         let dir = e.path();
@@ -217,7 +216,6 @@ pub fn video_node(ids: &[(u16, u16)]) -> Option<PathBuf> {
 }
 
 /// Other processes that have this device open, as "name (pid)".
-#[cfg(feature = "gui")]
 pub fn device_users(path: &str) -> Vec<String> {
     let Ok(want) = std::fs::canonicalize(path) else { return Vec::new() };
     let me = std::process::id().to_string();

@@ -4,7 +4,7 @@
 //! Extension Unit 4 by uvcvideo's XU query (as uvcdctl does).
 
 use crate::linux::{ioc, ioctl, IOC_READ, IOC_WRITE};
-use crate::tuning::{Kind, Value};
+use crate::controls::{Kind, Value};
 use std::fs::File;
 use std::io;
 use std::mem::{size_of, zeroed};
