@@ -40,12 +40,43 @@ jobs:
         with:
           name: k1cam-flasher-headless-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/k1cam-flasher
+  # The same for MIPS, a tier 3 target with no standard library to download:
+  # a pinned nightly builds one, and the tests run under QEMU.
+  mips:
+    runs-on: ubuntu-latest
+    env:
+      TARGET: mipsel-unknown-linux-musl
+      RUST: nightly-2026-10-24
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install $RUST --profile minimal --component rust-src
+      - run: tools/mips-musl.sh $RUST
+      - run: sudo apt-get update && sudo apt-get install -y qemu-user
+      # Not --release: the tests unwind, and build-std can't mix that with the
+      # release profile's panic = "abort".
+      - run: cargo +$RUST test --no-default-features --target $TARGET -Z build-std
+        env:
+          CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_RUNNER: qemu-mipsel
+      - run: cargo +$RUST build --release --no-default-features --target $TARGET -Z build-std=std,panic_abort
+      - name: Check that it is static and starts
+        run: |
+          bin=target/$TARGET/release/k1cam-flasher
+          file $bin
+          if readelf -lW $bin | grep -q INTERP || readelf -dW $bin | grep -q NEEDED; then
+            echo "$bin is linked dynamically"
+            exit 1
+          fi
+          qemu-mipsel $bin help >/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: k1cam-flasher-headless-${{ env.TARGET }}
+          path: target/${{ env.TARGET }}/release/k1cam-flasher
   # Every push to main replaces the files of one prerelease, "nightly", and
   # moves its tag, so releases/download/nightly/<file> is always the newest
   # build: no login, no zip, no expiry.
   nightly:
     if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
-    needs: [build, headless]
+    needs: [build, headless, mips]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -70,6 +101,7 @@ jobs:
           cp $a-headless-aarch64-unknown-linux-musl/k1cam-flasher dist/k1cam-flasher-cli-linux-aarch64
           cp $a-headless-armv7-unknown-linux-musleabihf/k1cam-flasher dist/k1cam-flasher-cli-linux-armv7
           cp $a-headless-arm-unknown-linux-musleabihf/k1cam-flasher dist/k1cam-flasher-cli-linux-armv6
+          cp $a-headless-mipsel-unknown-linux-musl/k1cam-flasher dist/k1cam-flasher-cli-linux-mipsel
           (cd dist && sha256sum * >SHA256SUMS)
       - name: Publish
         run: |

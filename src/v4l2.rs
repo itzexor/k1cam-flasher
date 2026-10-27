@@ -3,8 +3,8 @@
 //! its image controls, the standard ones by VIDIOC_*_CTRL and k1cam's own on
 //! Extension Unit 4 by uvcvideo's XU query (as uvcdctl does).
 
-use crate::linux::{ioc, ioctl, IOC_READ, IOC_WRITE};
 use crate::controls::{Kind, Value};
+use crate::linux::{ioc, ioctl, IOC_READ, IOC_WRITE};
 use std::fs::File;
 use std::io;
 use std::mem::{size_of, zeroed};
@@ -123,7 +123,10 @@ struct Buffer {
     bytesused: u32,
     flags: u32,
     field: u32,
-    timestamp: libc::timeval,
+    /// The kernel's own timeval, two longs: a 32-bit libc with 64-bit time
+    /// would change the struct's size, and with it the ioctl numbers, to ones
+    /// that only kernels from 5.6 on know.
+    timestamp: [libc::c_long; 2],
     timecode: Timecode,
     sequence: u32,
     memory: u32,
@@ -396,6 +399,20 @@ mod tests {
     use super::*;
 
     // The values the kernel headers give.
+    #[test]
+    #[cfg(target_pointer_width = "32")]
+    fn ioctl_numbers_32bit() {
+        // MIPS puts the write bit where the others put the read bit.
+        let (rw, w) = (0xc000_0000u32, if cfg!(target_arch = "mips") { 0x8000_0000 } else { 0x4000_0000 });
+        assert_eq!(VIDIOC_S_FMT, rw | 0x00cc_5605);
+        assert_eq!(VIDIOC_QUERYBUF, rw | 0x0044_5609);
+        assert_eq!(VIDIOC_QBUF, rw | 0x0044_560f);
+        assert_eq!(VIDIOC_DQBUF, rw | 0x0044_5611);
+        assert_eq!(VIDIOC_STREAMON, w | 0x0004_5612);
+        assert_eq!(VIDIOC_S_PARM, rw | 0x00cc_5616);
+        assert_eq!(VIDIOC_QUERYCTRL, rw | 0x0044_5624);
+    }
+
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn ioctl_numbers_x86_64() {

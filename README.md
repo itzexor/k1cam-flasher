@@ -27,6 +27,7 @@ The newest build of `main`, replaced on every push, is the [nightly release](htt
 | Linux aarch64 (64-bit Raspberry Pi OS) | | [k1cam-flasher-cli-linux-aarch64](https://github.com/itzexor/k1cam-flasher/releases/download/nightly/k1cam-flasher-cli-linux-aarch64) |
 | Linux armv7 (32-bit Raspberry Pi OS) | | [k1cam-flasher-cli-linux-armv7](https://github.com/itzexor/k1cam-flasher/releases/download/nightly/k1cam-flasher-cli-linux-armv7) |
 | Linux armv6 (Pi Zero, Pi 1) | | [k1cam-flasher-cli-linux-armv6](https://github.com/itzexor/k1cam-flasher/releases/download/nightly/k1cam-flasher-cli-linux-armv6) |
+| Linux MIPS, little-endian (MIPS32r2 or later) | | [k1cam-flasher-cli-linux-mipsel](https://github.com/itzexor/k1cam-flasher/releases/download/nightly/k1cam-flasher-cli-linux-mipsel) |
 | Windows x86_64 | [k1cam-flasher-windows-x86_64.exe](https://github.com/itzexor/k1cam-flasher/releases/download/nightly/k1cam-flasher-windows-x86_64.exe) | |
 | macOS Apple Silicon | [k1cam-flasher-macos-arm64](https://github.com/itzexor/k1cam-flasher/releases/download/nightly/k1cam-flasher-macos-arm64) | |
 | macOS Intel | [k1cam-flasher-macos-x86_64](https://github.com/itzexor/k1cam-flasher/releases/download/nightly/k1cam-flasher-macos-x86_64) | |
@@ -135,11 +136,21 @@ cargo build --release --no-default-features --target aarch64-unknown-linux-musl
 # -> target/aarch64-unknown-linux-musl/release/k1cam-flasher (static)
 ```
 
-The same works for `x86_64-unknown-linux-musl`, `armv7-unknown-linux-musleabihf` (32-bit Raspberry Pi OS) and `arm-unknown-linux-musleabihf` (ARMv6: Pi Zero, Pi 1); CI builds all four. On the target it needs access to `/dev/video*` (A/B) and `/dev/bus/usb` (cloner), e.g. as root or with the udev rule. MIPS boards are a tier 3 Rust target: nightly Rust with `-Z build-std=std,panic_abort --target mipsel-unknown-linux-musl` and a musl cross gcc as the linker (untested).
+The same works for `x86_64-unknown-linux-musl`, `armv7-unknown-linux-musleabihf` (32-bit Raspberry Pi OS) and `arm-unknown-linux-musleabihf` (ARMv6: Pi Zero, Pi 1); CI builds all four. On the target it needs access to `/dev/video*` (A/B) and `/dev/bus/usb` (cloner), e.g. as root or with the udev rule.
+
+Little-endian MIPS (`mipsel-unknown-linux-musl`: MIPS32r2 or later, software floating point, so an FPU doesn't matter) is a tier 3 Rust target, with no standard library to download. Nightly Rust builds one from source, and `tools/mips-musl.sh` puts the musl it links into the nightly's sysroot, from Rust 1.71.1, the last release that shipped the target; `rust-lld` links it statically as for ARM:
+
+```
+rustup toolchain install nightly-2026-10-24 --profile minimal --component rust-src
+tools/mips-musl.sh nightly-2026-10-24
+cargo +nightly-2026-10-24 build --release --no-default-features --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
+```
+
+CI builds it with that nightly and runs the tests under QEMU (`qemu-mipsel`). It hasn't been tried with a camera on MIPS hardware yet. Big-endian MIPS and MIPS32r1 aren't built.
 
 ## Build
 
-`cargo build --release` builds the GUI. It needs a C toolchain (for a Wayland build script on Linux, and libusb, which is vendored, on Windows and macOS); on Linux the build needs no extra GUI libraries beyond the usual X11/Wayland ones at runtime. CI in `.github/workflows/build.yml` builds the GUI on all three OSes (macOS for both Apple Silicon and Intel) and the static command-line binaries.
+`cargo build --release` builds the GUI. It needs a C toolchain (for a Wayland build script on Linux, and libusb, which is vendored, on Windows and macOS); on Linux the build needs no extra GUI libraries beyond the usual X11/Wayland ones at runtime. CI in `.github/workflows/build.yml` builds the GUI on all three OSes (macOS for both Apple Silicon and Intel) and the static command-line binaries, MIPS included.
 
 ## Embedded cloner data
 

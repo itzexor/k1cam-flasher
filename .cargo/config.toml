@@ -8,3 +8,9 @@ linker = "rust-lld"
 
 [target.arm-unknown-linux-musleabihf]
 linker = "rust-lld"
+
+# MIPS too (a tier 3 target; see the README), which Rust links dynamically
+# unless asked for a static binary.
+[target.mipsel-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]
