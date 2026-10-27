@@ -48,7 +48,7 @@ pub fn run(args: &[String]) -> Option<i32> {
     let Some(cmd) = args.first().map(String::as_str) else {
         return if gui { None } else { Some(usage()) };
     };
-    if gui && (cmd.starts_with("--tab=") || cmd.ends_with(".upd")) {
+    if gui && (cmd.starts_with("--tab=") || cmd.starts_with("--remote") || cmd.ends_with(".upd")) {
         return None;
     }
     if cmd == "daemon" {

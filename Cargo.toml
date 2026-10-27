@@ -17,7 +17,7 @@ crc32fast = "1"
 httparse = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"], optional = true }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11", "wayland", "clipboard"], optional = true }
 egui_extras = { version = "0.37", features = ["image"], optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg"], optional = true }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"], optional = true }

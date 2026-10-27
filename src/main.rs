@@ -21,6 +21,8 @@ mod lock;
 mod ops;
 #[cfg(feature = "gui")]
 mod overlay;
+#[cfg(feature = "gui")]
+mod remote;
 #[cfg(target_os = "linux")]
 mod serial;
 #[cfg(feature = "gui")]

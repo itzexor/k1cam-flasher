@@ -4,6 +4,10 @@
 //! itself about two seconds after the last one), so there is nothing to save here.
 //! Video and controls each run on a thread of their own, so a camera that
 //! stops answering can't hold up the window.
+//!
+//! For a camera on another computer (remote mode) the picture is a snapshot
+//! taken on request, or twice a second with Auto snapshot, instead of live
+//! video; the controls work the same.
 
 use crate::overlay::{self, Item, Metering};
 use eframe::egui::{self, RichText};
@@ -15,10 +19,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::controls::{Def, Group, Tuner, Value, DEFS};
+use crate::remote::{Remote, RemoteTuner, Snap};
+
 #[cfg(target_os = "linux")]
 use crate::v4l2 as video;
-
-use crate::controls::{Def, Group, Tuner, Value, DEFS};
 
 /// Elsewhere there is no V4L2 here; the tab says so, or works through a daemon.
 #[cfg(not(target_os = "linux"))]
@@ -42,6 +47,12 @@ mod video {
         }
     }
 }
+
+/// Auto snapshot asks this often at most; a slower answer just means fewer.
+const AUTO_EVERY: Duration = Duration::from_millis(500);
+
+/// A snapshot asked of the daemon, decoded on its way.
+type Asking = Receiver<Result<(Snap, Arc<egui::ColorImage>), String>>;
 
 /// A decoded frame, with the JPEG it came from for snapshots.
 struct Frame {
@@ -426,6 +437,24 @@ struct Shown {
 
 pub struct Tuning {
     own: crate::gui::Own,
+    /// The daemon whose camera this is, in remote mode.
+    remote: Option<Arc<Remote>>,
+    /// Remote: Auto snapshot is on. Off for each new connection; kept while
+    /// the tab is away.
+    auto: bool,
+    /// Remote: the snapshot asked for (one at a time), when the last one was
+    /// asked, and the newest one's sequence number.
+    asking: Option<Asking>,
+    snapshot_thread: Option<JoinHandle<()>>,
+    asked: Option<Instant>,
+    seq: u64,
+    /// Remote: the host's automatic capture runs, to be stopped when not wanted.
+    auto_running: bool,
+    snap_error: Option<String>,
+    /// When a control last changed here; a snapshot from before is stale.
+    changed: Option<Instant>,
+    /// Remote: the controls when the snapshot shown arrived, for the overlays.
+    frozen: Vec<Option<Value>>,
     connected: bool,
     node: Option<PathBuf>,
     scanned: Option<Instant>,
@@ -465,6 +494,16 @@ impl Tuning {
     pub fn new(own: crate::gui::Own) -> Self {
         Self {
             own,
+            remote: None,
+            auto: false,
+            asking: None,
+            snapshot_thread: None,
+            asked: None,
+            seq: 0,
+            auto_running: false,
+            snap_error: None,
+            changed: None,
+            frozen: Vec::new(),
             connected: false,
             node: None,
             scanned: None,
@@ -500,6 +539,12 @@ impl Tuning {
         std::mem::take(&mut self.log)
     }
 
+    /// Here, or another computer's camera: whatever was connected disconnects.
+    pub fn set_remote(&mut self, remote: Option<Arc<Remote>>) {
+        self.disconnect();
+        self.remote = remote;
+    }
+
     /// Follows a connection the user requested; an attachment alone does no I/O.
     pub fn poll(&mut self, ctx: &egui::Context, visible: bool, camera_up: bool) {
         self.retiring.retain(|t| !t.is_finished());
@@ -509,12 +554,81 @@ impl Tuning {
         if !self.connected {
             return;
         }
-        if self.node.is_none() && self.scanned.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
-            self.scanned = Some(Instant::now());
-            self.node = video::node();
+        if self.remote.is_some() {
+            self.poll_snapshots(ctx, visible);
+        } else {
+            if self.node.is_none() && self.scanned.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
+                self.scanned = Some(Instant::now());
+                self.node = video::node();
+            }
+            self.poll_stream(ctx, visible);
         }
-        self.poll_stream(ctx, visible);
         self.poll_controls(ctx, visible);
+    }
+
+    /// Remote: takes in an answered snapshot, and asks for the next one while
+    /// Auto snapshot is on and the tab shows. Nothing is asked otherwise.
+    fn poll_snapshots(&mut self, ctx: &egui::Context, visible: bool) {
+        if let Some(rx) = &self.asking {
+            match rx.try_recv() {
+                Ok(Ok((snap, image))) => {
+                    self.asking = None;
+                    let opts = egui::TextureOptions::LINEAR;
+                    match &mut self.texture {
+                        Some(t) => t.set(image.clone(), opts),
+                        None => self.texture = Some(ctx.load_texture("preview", image.clone(), opts)),
+                    }
+                    self.seq = snap.seq;
+                    let at = Instant::now().checked_sub(snap.age).unwrap_or_else(Instant::now);
+                    self.shown = Some(Shown { jpeg: snap.jpeg, image, fps: 0.0, at });
+                    self.frozen = self.vals.clone();
+                    self.snap_error = None;
+                }
+                // A failed one leaves the last picture.
+                Ok(Err(e)) => {
+                    self.asking = None;
+                    self.snap_error = Some(e);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.asking = None,
+            }
+        }
+        let auto = self.auto && visible;
+        if auto && self.asking.is_none() && self.asked.is_none_or(|t| t.elapsed() >= AUTO_EVERY) {
+            self.ask(ctx, true);
+        }
+        // The host stops its capture by itself a few seconds after the last
+        // request; it is told at once.
+        if !auto && self.auto_running && self.asking.is_none() {
+            self.auto_running = false;
+            if let Some(r) = self.remote.clone() {
+                self.retiring.push(std::thread::spawn(move || r.stop_snapshots()));
+            }
+        }
+        if auto || self.shown.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    /// Asks the daemon for a snapshot, unless one is on its way.
+    fn ask(&mut self, ctx: &egui::Context, auto: bool) {
+        let Some(r) = self.remote.clone() else { return };
+        if self.asking.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        let (size, after, ctx) = (self.size, if auto { self.seq } else { 0 }, ctx.clone());
+        self.snapshot_thread = Some(std::thread::spawn(move || {
+            let got = r.snapshot(size, auto, after).and_then(|s| {
+                let image = decode(&s.jpeg).ok_or("the snapshot is not a whole JPEG")?;
+                Ok((s, Arc::new(image)))
+            });
+            let _ = tx.send(got);
+            ctx.request_repaint();
+        }));
+        self.asked = Some(Instant::now());
+        self.auto_running |= auto;
+        self.asking = Some(rx);
     }
 
     fn poll_stream(&mut self, ctx: &egui::Context, visible: bool) {
@@ -583,9 +697,32 @@ impl Tuning {
     }
 
     fn disconnect(&mut self) {
+        let remote = self.remote.clone().filter(|_| self.connected);
+        self.auto = false;
+        self.asking = None;
+        self.asked = None;
+        self.seq = 0;
+        self.auto_running = false;
+        self.snap_error = None;
+        self.changed = None;
+        self.frozen.clear();
         self.connected = false;
         self.retire();
         self.retire_worker();
+        if let Some(t) = self.snapshot_thread.take() {
+            self.retiring.push(t);
+        }
+        if let Some(r) = remote {
+            // Workers and snapshots may still have requests on the way. Wait
+            // for them before closing tuning, and let jobs wait for that close.
+            let retiring = std::mem::take(&mut self.retiring);
+            self.retiring.push(std::thread::spawn(move || {
+                for t in retiring {
+                    let _ = t.join();
+                }
+                r.close_tuning();
+            }));
+        }
         self.node = None;
         self.scanned = None;
         self.loaded = false;
@@ -612,13 +749,21 @@ impl Tuning {
 
     fn poll_controls(&mut self, ctx: &egui::Context, visible: bool) {
         if visible && self.worker.is_none() && self.retiring.is_empty() && self.ctl_error.is_none() {
-            if let Some(node) = self.node.clone() {
+            let open: Option<OpenTuner> = match (&self.remote, &self.node) {
+                (Some(r), _) => {
+                    let r = r.clone();
+                    Some(Box::new(move || Ok(Box::new(RemoteTuner(r)) as Box<dyn Tuner>)))
+                }
+                (None, Some(node)) => Some(local_tuner(node.clone())),
+                (None, None) => None,
+            };
+            if let Some(open) = open {
                 let (tx, wrx) = channel();
                 let (wtx, rx) = channel();
                 let (stop, watch) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
                 let (stop2, watch2) = (stop.clone(), watch.clone());
                 let ctx = ctx.clone();
-                let thread = std::thread::spawn(move || worker(local_tuner(node), wrx, wtx, stop2, watch2, ctx));
+                let thread = std::thread::spawn(move || worker(open, wrx, wtx, stop2, watch2, ctx));
                 let _ = tx.send(Req::Load);
                 self.worker = Some(Worker { tx, rx, stop, watch, thread: Some(thread) });
             }
@@ -687,8 +832,8 @@ impl Tuning {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, camera_up: bool) {
-        if cfg!(not(target_os = "linux")) {
-            ui.label("The live preview and the image controls need Linux for now (V4L2).");
+        if cfg!(not(target_os = "linux")) && self.remote.is_none() {
+            ui.label("The live preview and the image controls need Linux (V4L2), or a camera on another computer: see the connection menu at the top right.");
             return;
         }
         if !camera_up {
@@ -724,12 +869,21 @@ impl Tuning {
         ui.horizontal(|ui| {
             if !self.connected {
                 if ui.add_enabled(self.retiring.is_empty(), egui::Button::new("Connect")).clicked() {
-                    match self.own.hold() {
-                        Ok(()) => { self.connected = true; self.retry = Instant::now(); }
+                    // Here, this computer's flashers take turns with the camera.
+                    match if self.remote.is_some() { Ok(()) } else { self.own.hold() } {
+                        Ok(()) => {
+                            self.note.clear();
+                            self.connected = true;
+                            self.retry = Instant::now();
+                        }
                         Err(e) => self.note = e,
                     }
                 }
-                ui.label(RichText::new("to preview the camera and change its image controls").color(ui.visuals().weak_text_color()));
+                if self.note.is_empty() {
+                    ui.label(RichText::new("to preview the camera and change its image controls").color(ui.visuals().weak_text_color()));
+                } else {
+                    ui.label(RichText::new(&self.note).color(ui.visuals().warn_fg_color));
+                }
                 return;
             }
             if ui.button("Disconnect").clicked() {
@@ -737,6 +891,11 @@ impl Tuning {
                 return;
             }
             ui.separator();
+            if self.remote.is_some() {
+                self.snapshot_tools(ui);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.controls_state(ui));
+                return;
+            }
             let (label, tip) = if self.live {
                 ("Pause", "Stop the preview, which frees the camera's video for other programs")
             } else {
@@ -777,6 +936,44 @@ impl Tuning {
         });
     }
 
+    /// Remote: Snapshot, Auto snapshot, the size, and saving the picture shown.
+    fn snapshot_tools(&mut self, ui: &mut egui::Ui) {
+        let pending = self.asking.is_some();
+        let why = if self.auto { "Auto snapshot is taking them" } else { "Taking one…" };
+        if ui
+            .add_enabled(!pending && !self.auto, egui::Button::new("Snapshot"))
+            .on_hover_text("Take a picture now and show it")
+            .on_disabled_hover_text(why)
+            .clicked()
+        {
+            self.ask(ui.ctx(), false);
+        }
+        let r = ui.checkbox(&mut self.auto, "Auto snapshot (2 fps)");
+        if r.on_hover_text("Take one twice a second while this tab shows; the camera's video runs meanwhile").changed() && self.auto {
+            // The first one at once.
+            self.asked = None;
+        }
+        let size = self.size;
+        egui::ComboBox::from_id_salt("preview-size").selected_text(format!("{}×{}", size.0, size.1)).show_ui(ui, |ui| {
+            for &s in &self.sizes {
+                ui.selectable_value(&mut self.size, s, format!("{}×{}", s.0, s.1));
+            }
+        });
+        let have = self.shown.is_some();
+        if ui
+            .add_enabled(have, egui::Button::new("Save snapshot…"))
+            .on_hover_text("Save the snapshot on screen as the camera sent it (JPEG), without taking another")
+            .clicked()
+        {
+            self.snapshot();
+        }
+        if ui.add_enabled(have, egui::Button::new("Copy")).on_hover_text("Copy the snapshot on screen").clicked() {
+            if let Some(s) = &self.shown {
+                ui.ctx().copy_image((*s.image).clone());
+            }
+        }
+    }
+
     /// Right to left: the factory reset, then what the controls are doing.
     fn controls_state(&mut self, ui: &mut egui::Ui) {
         let weak = ui.visuals().weak_text_color();
@@ -812,7 +1009,17 @@ impl Tuning {
     fn preview_ui(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let streaming = self.stream.as_ref().is_some_and(|c| c.size.is_some());
         let (Some(tex), Some(s)) = (&self.texture, &self.shown) else {
-            let text: String = if self.node.is_none() {
+            let text: String = if let Some(r) = &self.remote {
+                if self.asking.is_some() {
+                    format!("Taking a snapshot on {}…", r.host)
+                } else if let Some(e) = &self.snap_error {
+                    format!("No snapshot: {e}")
+                } else {
+                    "No snapshot yet. Snapshot takes one now; Auto snapshot takes one twice a second while this tab shows. \
+                     Nothing is captured until you ask."
+                        .into()
+                }
+            } else if self.node.is_none() {
                 "The camera's video device was not found (/dev/video*).".into()
             } else if !self.note.is_empty() {
                 self.note.clone()
@@ -830,8 +1037,18 @@ impl Tuning {
         let (image, at) = (s.image.clone(), s.at);
         // What is shown, and why it may be stale.
         let [w, h] = image.size;
-        let mut caption = format!("{w}×{h}");
-        if streaming && at.elapsed() < Duration::from_secs(2) {
+        let (mut caption, mut warn) = (format!("{w}×{h}"), String::new());
+        if self.remote.is_some() {
+            caption += &format!("  ·  {} KiB  ·  {}", s.jpeg.len().div_ceil(1024), age(at.elapsed()));
+            if self.auto {
+                caption += "  ·  auto, twice a second";
+            } else if self.changed.is_some_and(|c| c > at) {
+                warn += "  ·  taken before your last change";
+            }
+            if let Some(e) = &self.snap_error {
+                warn += &format!("  ·  {e}; showing the last good one");
+            }
+        } else if streaming && at.elapsed() < Duration::from_secs(2) {
             caption += &format!("  ·  {:.0} fps  ·  {} KiB per frame", s.fps, s.jpeg.len().div_ceil(1024));
         } else if !self.live {
             caption += "  ·  paused";
@@ -851,11 +1068,24 @@ impl Tuning {
             caption += &format!("  ·  at {x}, {y}: R {} G {} B {}", c.r(), c.g(), c.b());
         }
         let font = egui::FontId::proportional(12.0);
-        let galley = painter.layout_no_wrap(caption, font, egui::Color32::WHITE);
+        let mut job = egui::text::LayoutJob::default();
+        job.append(&caption, 0.0, egui::TextFormat::simple(font.clone(), egui::Color32::WHITE));
+        job.append(&warn, 0.0, egui::TextFormat::simple(font, egui::Color32::from_rgb(255, 179, 71)));
+        let galley = painter.layout_job(job);
         let at = rect.left_bottom() + egui::vec2(6.0, -6.0 - galley.size().y);
         painter.rect_filled(egui::Rect::from_min_size(at, galley.size()).expand(4.0), 4.0, overlay::BACKDROP);
         painter.galley(at, galley, egui::Color32::WHITE);
         self.overlay_menu(ui, rect);
+    }
+
+    /// A control's value as it was for the picture shown: for a snapshot,
+    /// when it arrived; for live video, now.
+    fn view_value(&self, name: &str) -> Option<i32> {
+        if self.remote.is_none() {
+            return self.value(name);
+        }
+        let i = DEFS.iter().position(|d| d.name == name)?;
+        Some(self.frozen.get(i).copied().flatten()?.value)
     }
 
     /// A control's value, if the camera has it.
@@ -867,7 +1097,8 @@ impl Tuning {
     /// The overlays chosen, over the frame shown in `rect`.
     fn overlays_ui(&mut self, ctx: &egui::Context, p: &egui::Painter, rect: egui::Rect, image: &egui::ColorImage, at: Instant) {
         let o = &self.overlays;
-        let (zoom, pan, tilt) = (self.value("zoom").unwrap_or(100), self.value("pan").unwrap_or(0), self.value("tilt").unwrap_or(0));
+        let (zoom, pan, tilt) =
+            (self.view_value("zoom").unwrap_or(100), self.view_value("pan").unwrap_or(0), self.view_value("tilt").unwrap_or(0));
         let view = overlay::View::new(image.size, zoom, pan, tilt);
         if !(o.metering || o.clipping || o.histogram) {
             if o.grid {
@@ -898,7 +1129,7 @@ impl Tuning {
             overlay::draw_grid(p, rect);
         }
         if o.metering {
-            let mode = self.value("metering").and_then(Metering::from_value);
+            let mode = self.view_value("metering").and_then(Metering::from_value);
             let (slices, [min, median, max]) = overlay::slices(&m.zones);
             let none = overlay::Grid::<bool>::default();
             let (weights, marked) = match mode {
@@ -919,7 +1150,7 @@ impl Tuning {
                 None => "not reported by this camera",
             }
             .to_string();
-            if self.value("auto-exposure") == Some(1) {
+            if self.view_value("auto-exposure") == Some(1) {
                 name += "; unused, as exposure is manual";
             }
             legend.push(vec![Item::Text(format!("Metering: {name}"))]);
@@ -1033,6 +1264,7 @@ impl Tuning {
             ui.horizontal(|ui| {
                 if ui.button("Reset all").clicked() {
                     self.send(Req::Reset);
+                    self.changed = Some(Instant::now());
                     self.confirm_reset = false;
                 }
                 if ui.button("Keep them").clicked() {
@@ -1140,8 +1372,18 @@ impl Tuning {
                     x.value = new;
                 }
                 self.send(Req::Set(k, new));
+                self.changed = Some(Instant::now());
             }
         }
+    }
+}
+
+/// How old a snapshot is, for its caption.
+fn age(d: Duration) -> String {
+    match d.as_secs() {
+        0..=9 => format!("{:.1} s old", d.as_secs_f32()),
+        10..=59 => format!("taken {} s ago", d.as_secs()),
+        s => format!("taken {} min ago", s / 60),
     }
 }
 
@@ -1198,10 +1440,13 @@ mod tests {
         let watch = Arc::new(AtomicBool::new(false));
         tuning.worker = Some(Worker { tx, rx, stop: worker_stop.clone(), watch, thread: Some(std::thread::spawn(|| {})) });
         tuning.retiring.push(std::thread::spawn(|| {}));
+        let (release, waiting) = channel();
+        tuning.snapshot_thread = Some(std::thread::spawn(move || waiting.recv().unwrap()));
         let threads = tuning.stop();
         assert!(capture_stop.load(Ordering::Relaxed));
         assert!(worker_stop.load(Ordering::Relaxed));
-        assert_eq!(threads.len(), 3);
+        assert_eq!(threads.len(), 4);
+        release.send(()).unwrap();
         for t in threads {
             t.join().unwrap();
         }
@@ -1209,6 +1454,73 @@ mod tests {
         tuning.poll(&egui::Context::default(), true, true);
         assert!(tuning.stream.is_none());
         assert!(tuning.worker.is_none());
+    }
+
+    /// Remote: no picture until asked; one request at a time; Auto snapshot
+    /// at most twice a second, only while the tab shows, off again for a new
+    /// connection.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn remote_snapshots_come_only_when_asked_and_one_at_a_time() {
+        use crate::daemon::tests::{daemon, scratch, Fake, PASSWORD};
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = scratch("tuning-remote");
+        let fake = Arc::new(Fake::default());
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(16, 9).write_to(&mut jpeg, image::ImageFormat::Jpeg).unwrap();
+        *fake.picture.lock().unwrap() = Some(jpeg.into_inner());
+        let d = daemon(&dir, fake.clone());
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        std::thread::spawn(move || crate::daemon::serve(l, d));
+        let r = Remote::connect(&addr, PASSWORD).unwrap();
+        let ctx = egui::Context::default();
+        let mut t = Tuning::new(crate::gui::Own::default());
+        t.set_remote(Some(r));
+        t.connected = true;
+        let settle = |t: &mut Tuning, visible: bool, ms: u64| {
+            let end = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < end {
+                t.poll(&ctx, visible, true);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        // Connecting, reading the controls and showing the tab take no picture.
+        settle(&mut t, true, 400);
+        assert!(t.loaded && !t.auto && t.shown.is_none());
+        assert_eq!(fake.frames_opened.load(SeqCst), 0);
+        // Snapshot asks once; asking again while it is on its way does nothing.
+        t.ask(&ctx, false);
+        t.ask(&ctx, false);
+        settle(&mut t, true, 600);
+        assert!(t.shown.is_some() && t.asking.is_none());
+        assert_eq!((fake.frames_opened.load(SeqCst), fake.frames_open.load(SeqCst)), (1, 0), "one capture, stopped again");
+        // A change after it makes it stale.
+        t.changed = Some(Instant::now());
+        assert!(t.changed > t.shown.as_ref().map(|s| s.at));
+        // Auto snapshot: the first at once, then at most every 500 ms.
+        t.auto = true;
+        t.asked = None;
+        let mut seqs = Vec::new();
+        let end = Instant::now() + Duration::from_millis(1200);
+        while Instant::now() < end {
+            t.poll(&ctx, true, true);
+            if seqs.last() != Some(&t.seq) {
+                seqs.push(t.seq);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!((3..=4).contains(&seqs.len()), "{seqs:?}");
+        // Hidden: no more requests, and the host's capture stops.
+        let before = t.seq;
+        settle(&mut t, false, 700);
+        assert_eq!(t.seq, before);
+        assert!(t.auto, "kept while the tab is away");
+        assert_eq!(fake.frames_open.load(SeqCst), 0);
+        // A new connection starts with it off.
+        t.disconnect();
+        assert!(!t.auto);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     const WIDE: f32 = 16.0 / 9.0;

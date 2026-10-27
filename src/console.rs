@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! The camera's console on its USB serial port (CDC-ACM, found by the k1cam USB
-//! ids). Connect opens it on request; type a line, Enter sends it.
+//! ids), here or through another computer's daemon. Connect opens it on
+//! request; type a line, Enter sends it.
 
+use crate::remote::{Remote, RemotePort};
 use eframe::egui;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -189,13 +191,27 @@ impl Drop for Conn {
     }
 }
 
+/// A port: reads wait a moment (TimedOut when nothing came), and 0 means it went away.
+pub trait Link: Read + Write + Send {}
+impl<T: Read + Write + Send> Link for T {}
+
+/// Opens the port, on the connection thread.
+type Opener = Box<dyn FnOnce() -> Result<Box<dyn Link>, String> + Send>;
+
+fn serial_opener(name: String) -> Opener {
+    Box::new(move || {
+        let p = serialport::new(&name, 115200).timeout(Duration::from_millis(50)).open().map_err(|e| format!("{name}: {e}"))?;
+        Ok(Box::new(p) as Box<dyn Link>)
+    })
+}
+
 /// The connection thread: what arrives goes to `tx`, what comes from `out` to
 /// the port, until `stop`.
-fn run_port(name: String, out: Receiver<Vec<u8>>, tx: Sender<Msg>, stop: Arc<AtomicBool>, repaint: impl Fn()) {
-    let mut port = match serialport::new(&name, 115200).timeout(Duration::from_millis(50)).open() {
+fn run_port(name: String, open: Opener, out: Receiver<Vec<u8>>, tx: Sender<Msg>, stop: Arc<AtomicBool>, repaint: impl Fn()) {
+    let mut port = match open() {
         Ok(p) => p,
         Err(e) => {
-            let _ = tx.send(Msg::Failed(format!("{name}: {e}")));
+            let _ = tx.send(Msg::Failed(e));
             repaint();
             return;
         }
@@ -228,6 +244,8 @@ fn run_port(name: String, out: Receiver<Vec<u8>>, tx: Sender<Msg>, stop: Arc<Ato
 
 pub struct Console {
     own: crate::gui::Own,
+    /// The daemon whose camera's console this is, in remote mode.
+    remote: Option<Arc<Remote>>,
     port: Option<String>,
     conn: Option<Conn>,
     /// The old port must finish closing before another connection or a job.
@@ -252,6 +270,7 @@ impl Console {
     pub fn new(own: crate::gui::Own) -> Self {
         Self {
             own,
+            remote: None,
             port: None,
             conn: None,
             closing: None,
@@ -284,6 +303,15 @@ impl Console {
             self.closing = c.thread.take();
             self.note = "Disconnected".into();
         }
+    }
+
+    /// Here, or another computer's camera: whatever was open closes.
+    pub fn set_remote(&mut self, remote: Option<Arc<Remote>>) {
+        self.disconnect();
+        self.remote = remote;
+        self.port = None;
+        self.scanned = None;
+        self.note = "Waiting for the camera's console".into();
     }
 
     /// The job waits for the serial port to close before it starts.
@@ -327,7 +355,10 @@ impl Console {
             return;
         }
         self.scanned = Some(Instant::now());
-        let found = find_port();
+        let found = match &self.remote {
+            Some(r) => r.status().console.then(|| format!("the console on {}", r.host)),
+            None => find_port(),
+        };
         if found != self.port {
             if self.conn.as_ref().is_some_and(|c| Some(&c.name) != found.as_ref()) {
                 self.disconnect();
@@ -346,23 +377,29 @@ impl Console {
         if self.conn.is_some() || self.closing.is_some() {
             return;
         }
-        #[cfg(target_os = "linux")]
-        {
-            let users = crate::linux::device_users(name);
-            if !users.is_empty() {
-                self.note = format!("{name} is open in {}; not connecting so that it keeps its output", users.join(", "));
-                return;
+        let open = match self.remote.clone() {
+            Some(r) => Box::new(move || Ok(Box::new(RemotePort::open(r)?) as Box<dyn Link>)) as Opener,
+            None => {
+                #[cfg(target_os = "linux")]
+                {
+                    let users = crate::linux::device_users(name);
+                    if !users.is_empty() {
+                        self.note = format!("{name} is open in {}; not connecting so that it keeps its output", users.join(", "));
+                        return;
+                    }
+                }
+                if let Err(e) = self.own.hold() {
+                    self.note = e;
+                    return;
+                }
+                serial_opener(name.to_string())
             }
-        }
-        if let Err(e) = self.own.hold() {
-            self.note = e;
-            return;
-        }
+        };
         let (tx, rx) = channel();
         let (out, out_rx) = channel();
         let stop = Arc::new(AtomicBool::new(false));
         let (name2, stop2, ctx) = (name.to_string(), stop.clone(), ctx.clone());
-        let thread = std::thread::spawn(move || run_port(name2, out_rx, tx, stop2, || ctx.request_repaint()));
+        let thread = std::thread::spawn(move || run_port(name2, open, out_rx, tx, stop2, || ctx.request_repaint()));
         self.note = format!("Connecting to {name}…");
         self.conn = Some(Conn { name: name.into(), out, rx, stop, open: false, thread: Some(thread) });
     }
@@ -495,7 +532,7 @@ mod tests {
         let (out, out_rx) = channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
-        let t = std::thread::spawn(move || run_port(name, out_rx, tx, stop2, || {}));
+        let t = std::thread::spawn(move || run_port(name.clone(), serial_opener(name), out_rx, tx, stop2, || {}));
         assert!(matches!(rx.recv_timeout(Duration::from_secs(5)), Ok(Msg::Opened)));
         master.write_all(b"# ").unwrap();
         match rx.recv_timeout(Duration::from_secs(5)) {

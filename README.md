@@ -1,12 +1,13 @@
 # k1cam-flasher
 
-A small, single-binary GUI to back up, flash and update the Creality K1 camera (Ingenic T31L, 8 MiB SPI NOR) on Linux, Windows and macOS, and the same operations as a command line, which also builds as a small static binary for the Linux boards a camera gets plugged into (see [Command line](#command-line) and [Static builds](#static-builds)).
+A small, single-binary GUI to back up, flash and update the Creality K1 camera (Ingenic T31L, 8 MiB SPI NOR) on Linux, Windows and macOS, and the same operations as a command line, which also builds as a small static binary for the Linux boards a camera gets plugged into (see [Command line](#command-line) and [Static builds](#static-builds)). The camera can also be plugged into another Linux computer running `k1cam-flasher daemon`, and used from the GUI over the network (see [A camera on another computer](#a-camera-on-another-computer)).
 
 - **Backup & Flash (cloner)**: full read and full flash with the Ingenic cloner protocol, through the boot ROM's USB boot mode, ported from [thingino-dfu](https://github.com/gtxaspec/thingino-dfu) (T31 family only), with read-back verification.
-- **A/B Update (k1cam)**: dump, update the inactive slot, reboot into the trial or cancel it, over the k1cam UVC extension unit protocol (same as `uvcdctl firmware`). On Linux it uses the uvcvideo XU ioctl on `/dev/videoN` (needs access to the video node, e.g. the `video` group); on macOS it uses libusb (untested). Not available on Windows. The tab shows what the connected camera runs (build, kernel commit, slots, boot state) next to what the chosen `k1cam.upd` holds (build, commit, kernel, sizes against the slot sizes, and its os-release, after checking its digests), and whether the camera would take it. `k1cam-flasher FILE.upd` opens the A/B tab with that bundle.
-- **Tuning** (Linux): press *Connect* for the camera's picture, live (MJPEG at a size and rate you choose), as large as the window allows with every image control still in view: picture, exposure, white balance, noise, view and encoder settings, as `uvcdctl` names them, flowing down columns beside and below the picture. The camera keeps every change itself; an active control that differs from its default stands out, clicking its name puts the default back, and *Factory defaults* resets them all. Exposure time and white balance temperature have an *auto* check box on their row, and while it is on the slider follows what the camera chooses (white balance once uvcd reports it). *Overlays* on the picture show where the camera meters exposure and how bright each of its zones is, clipped highlights and crushed shadows, a histogram and a framing grid, and the picture reads out the pixel under the pointer. *Snapshot* saves the frame on screen as the camera sent it (JPEG). The preview runs only while the tab is shown; *Pause* frees the video, and *Disconnect* closes tuning entirely.
+- **A/B Update (k1cam)**: dump, update the inactive slot, reboot into the trial or cancel it, over the k1cam UVC extension unit protocol (same as `uvcdctl firmware`). On Linux it uses the uvcvideo XU ioctl on `/dev/videoN` (needs access to the video node, e.g. the `video` group); on macOS it uses libusb (untested). Not available on Windows itself, only through [another computer](#a-camera-on-another-computer). The tab shows what the connected camera runs (build, kernel commit, slots, boot state) next to what the chosen `k1cam.upd` holds (build, commit, kernel, sizes against the slot sizes, and its os-release, after checking its digests), and whether the camera would take it. `k1cam-flasher FILE.upd` opens the A/B tab with that bundle.
+- **Tuning** (Linux, or [another computer](#a-camera-on-another-computer) with snapshots): press *Connect* for the camera's picture, live (MJPEG at a size and rate you choose), as large as the window allows with every image control still in view: picture, exposure, white balance, noise, view and encoder settings, as `uvcdctl` names them, flowing down columns beside and below the picture. The camera keeps every change itself; an active control that differs from its default stands out, clicking its name puts the default back, and *Factory defaults* resets them all. Exposure time and white balance temperature have an *auto* check box on their row, and while it is on the slider follows what the camera chooses (white balance once uvcd reports it). *Overlays* on the picture show where the camera meters exposure and how bright each of its zones is, clipped highlights and crushed shadows, a histogram and a framing grid, and the picture reads out the pixel under the pointer. *Snapshot* saves the frame on screen as the camera sent it (JPEG). The preview runs only while the tab is shown; *Pause* frees the video, and *Disconnect* closes tuning entirely.
 - **Console**: the camera's USB serial console (CDC-ACM, same USB ids). *Connect* works once the console is detected; press it to open the console. It doesn't connect while another program has the port open (Linux), so that program keeps its output; while connected, other programs can't open the port until you press *Disconnect*. Type a line and press Enter (an empty line wakes the prompt), *Ctrl-C* stops what runs in the foreground. After a reboot or unplug, press *Connect* again.
-- **Help** (*Help*, top right): forcing USB boot mode (see below), drivers and permissions.
+- **Help** (*Help*, top right): forcing USB boot mode (see below), drivers and permissions, and using a camera on another computer.
+- **Connection menu** (left of *Help*): whether the camera is plugged into this computer or into another one running the daemon; see [below](#a-camera-on-another-computer).
 
 The status bar under the tabs shows whether the open tab's device is attached (green when it is) and follows a running operation (blue): its progress, what it last said, the time taken and left, and *Cancel*. Beside Backup & Flash and A/B Update, the log shows each operation under a heading with when it started, how long it took and how it ended; it opens by itself when one starts, and folded away to a strip it counts the operations finished since, in red if one failed. A tab's lines are all there from the start, so nothing moves as results come in. Dropping a `k1cam.upd` on the window opens it on the A/B tab, a `.bin` image on Backup & Flash. Closing the window while an operation runs asks first.
 
@@ -88,12 +89,41 @@ k1cam-flasher detect                    # cloner: identify the flash chip
 k1cam-flasher backup backup.bin         # cloner: read the whole flash
 k1cam-flasher flash k1cam.bin --yes     # cloner: replace the whole flash
 k1cam-flasher check k1cam.upd           # what a bundle holds, no camera needed
-k1cam-flasher daemon --token-file FILE  # serve this camera over HTTP on Linux
+k1cam-flasher daemon                   # serve the camera here to a GUI elsewhere (Linux)
 ```
 
 `flash` backs up next to the image, verifies and reboots unless told not to (`--no-backup`, `--no-verify`, `--no-reboot`); `update --no-reboot` only stages. Progress and messages go to stderr, results to stdout; the exit status is 0 on success, 1 on failure and 2 for usage errors. Output files are never overwritten. Ctrl-C stops an operation cleanly (a dump or upload ends its session on the camera); a second Ctrl-C quits at once.
 
 On Linux, one k1cam-flasher at a time uses the camera: a command, the GUI (while it runs a job, reads the camera's information, tunes or has the console open) or the daemon (while a GUI controls it or a job runs). The others are told which one has it, e.g. `the camera is in use by k1cam-flasher daemon (pid 812), controlled from alex@studio (10.0.0.20)`. Firmware operations also refuse to start while another program has the camera's video node open, and name it; nothing is stopped for you.
+
+## A camera on another computer
+
+The camera can stay plugged into another Linux computer (a Raspberry Pi, a router, the printer's mainboard) while the GUI runs here, on any system. On that computer, as a user who can open the camera (see the udev rule), run:
+
+```
+k1cam-flasher daemon
+```
+
+It runs in the terminal while you need it and prints what to enter in the GUI:
+
+```
+k1cam-flasher daemon: listening on 0.0.0.0:19249 (plain HTTP: use it on a network you trust)
+  connect to:  printer-pi, 192.168.1.40
+  code:        8ESDUG  (a new one after 5 wrong attempts)
+```
+
+The code is six letters and digits (no 0/O or 1/I; case doesn't matter), new each time the daemon starts. The code is asked only to connect: after five different wrong ones the daemon makes and prints a new one, and the window connected already stays connected. A window whose connection lapsed, or whose daemon restarted, asks for the new code once (sending nothing more with the old one meanwhile) and carries on where it was, an operation it follows included. In the GUI, open the connection menu at the top right, choose *Another computer*, and enter one of the addresses and the code. *Remember* keeps the host in this user's configuration directory. `k1cam-flasher --remote HOST` opens the connection menu with that host filled in.
+
+Ctrl-C stops the daemon. While a job runs, the first Ctrl-C lets it finish (no new job starts) and stops the daemon then; a second cancels the job, as the GUI's *Cancel* does, which can leave a flash half-written; a third quits at once. On the way out it names the backups no GUI has saved yet.
+
+Then every tab works on that camera, Windows included:
+
+- **Files stay here.** An image or bundle is sent when its job starts, and the daemon keeps it in memory only. A backup or dump comes back into the file chosen here once the job ends; a flash's backup lands next to the image, as it does locally. Until then the daemon keeps the backup on disk (in `~/.local/state/k1cam-flasher`, or `/var/lib/k1cam-flasher` as root), and it keeps it until a GUI has saved it: if the transfer fails or the window closed, the GUI offers to save it (or discard it) the next time it connects. It keeps at most four; beyond that, new backups are refused rather than old ones deleted.
+- **Jobs carry on.** If the connection drops, the job runs on there; the window says so, keeps trying, and catches up when the connection is back. Closing the window offers to leave the job running. A job is never started twice by a repeated request, and one cut off by the daemon stopping is reported as interrupted, never resumed. Jobs are refused if their recovery record cannot be saved; an unreadable record prevents the daemon starting until it is repaired.
+- **Tuning shows snapshots.** Instead of live video, *Snapshot* takes one picture (the camera's video runs only for it), and *Auto snapshot (2 fps)* takes one every half second while the tab shows; it is off at each new connection. Nothing is captured until asked. The caption says how old the picture is, and marks it once a control has changed since. *Save snapshot…* saves the picture shown, without taking another. The controls work as they do locally.
+- **One window at a time** controls the camera there. It renews its session every second; the daemon lets go of the camera 15 s after it was last heard from (a job keeps running), and until then refuses other GUIs, saying which one has it. The same window reconnects with its session credential, even if its network address changes. A new or restarted window waits for the previous session to disconnect or expire.
+
+The connection is plain HTTP on port 19249 (0x4b31, the camera's USB product id), the code and then a session id in the clear: use it on a network you trust. The port is outside the ranges Linux and Windows pick outgoing ports from, so the daemon can always bind it.
 
 ## Static builds
 
@@ -119,7 +149,7 @@ The same works for `x86_64-unknown-linux-musl`, `armv7-unknown-linux-musleabihf`
 
 Mixed, per file (SPDX identifiers in the sources, texts in `LICENSES/`):
 
-- **MIT**: the GUI, the console, the tuning tab, the command line, the k1cam A/B protocol client, the bundle parser, the USB, Linux and V4L2 device layers (`src/usb.rs`, `src/linux.rs`, `src/v4l2.rs`), udev rule and build files.
+- **MIT**: the GUI, the console, the tuning tab, the command line, the daemon and the GUI's remote mode (`src/daemon.rs`, `src/remote.rs`, `src/http.rs`, `src/api.rs`), the k1cam A/B protocol client, the bundle parser, the image controls, the USB, Linux, serial and V4L2 device layers and the lock (`src/usb.rs`, `src/linux.rs`, `src/serial.rs`, `src/v4l2.rs`, `src/lock.rs`, `src/controls.rs`), udev rule and build files.
 - **GPL-2.0-only**: `src/cloner/` and `tools/gen-cloner-data/`, which are derived from [thingino-dfu](https://github.com/gtxaspec/thingino-dfu), and the embedded burner SPL/U-Boot and generated blobs in `src/cloner/data/` (GPL U-Boot, thingino-dfu output).
 - **CC0-1.0** (public domain): the photo `docs/short-nor-pins.jpg`, the synthetic test bundle `tests/data/golden.upd` and this documentation.
 

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
 //! The GUI: cloner backup and flash, A/B update, tuning with a live preview,
-//! the camera's console, and help on forcing USB boot mode.
+//! the camera's console, and help on forcing USB boot mode; for a camera
+//! attached here, or to another computer running `k1cam-flasher daemon`.
 
 use crate::job::{Event, Job};
-use crate::{bundle, cloner, console, ops, tuning, xu};
+use crate::remote::{self, Link, Remote};
+use crate::{api, bundle, cloner, console, ops, tuning, xu};
 use eframe::egui::{self, Color32, RichText};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,11 +34,27 @@ enum Op {
     Update,
     Reboot,
     Cancel,
+    /// Saving a backup another computer kept.
+    Fetch,
 }
 
 impl Op {
+    /// A job found running on the host, by the name the daemon gives it.
+    fn from_name(name: &str) -> Op {
+        match name {
+            "detect" => Op::Detect,
+            "backup" => Op::Backup,
+            "flash" => Op::Flash,
+            "dump" => Op::Dump,
+            "update" => Op::Update,
+            "reboot" => Op::Reboot,
+            _ => Op::Cancel,
+        }
+    }
+
     fn title(self) -> &'static str {
         match self {
+            Op::Fetch => "Save a backup from the host",
             Op::Detect => "Detect flash chip",
             Op::Backup => "Back up with the cloner",
             Op::Flash => "Flash with the cloner",
@@ -53,6 +71,7 @@ impl Op {
             Op::Flash => "Stopping a flash halfway leaves the camera unable to boot until it is flashed again with the cloner.",
             Op::Update => "The camera keeps booting what it runs now; an install it has already started still finishes.",
             Op::Backup | Op::Dump => "Stopping now leaves no backup.",
+            Op::Fetch => "The host keeps the backup until it is saved.",
             _ => "It stops cleanly.",
         }
     }
@@ -121,6 +140,14 @@ struct App {
     log_collapsed: bool,
     log_seen: usize,
     own: Own,
+    /// The other computer whose camera this is, in remote mode.
+    remote: Option<Arc<Remote>>,
+    conn: ConnMenu,
+    /// Backups the host keeps that this computer hasn't saved.
+    held: Vec<api::Job>,
+    held_rx: Option<Receiver<Result<Vec<api::Job>, String>>>,
+    /// Quit while a remote job runs, leaving it running there.
+    quit_anyway: bool,
 }
 
 /// This computer's flasher lock (lock.rs), held while the GUI uses the camera
@@ -160,6 +187,33 @@ impl Own {
         }
     }
 
+    fn set_enabled(&self, enabled: bool) {
+        self.0.lock().unwrap().enabled = enabled;
+        if !enabled {
+            self.release();
+        }
+    }
+}
+
+/// The connection menu: where the camera is plugged in.
+struct ConnMenu {
+    /// "Another computer" is chosen, so its fields show.
+    elsewhere: bool,
+    host: String,
+    password: String,
+    remember: bool,
+    connecting: Option<Receiver<Result<Arc<Remote>, String>>>,
+    /// A refused or taken connection taking its session again.
+    reconnecting: Option<Receiver<Result<(), String>>>,
+    error: Option<String>,
+    /// Open the menu (a connection failed, or needs a new code, without it open).
+    open: bool,
+    /// Close the menu (a connection it started succeeded).
+    close: bool,
+    /// The connection is refused or taken: the menu opened for it once.
+    stuck: bool,
+    /// Put the cursor in the code field.
+    focus_code: bool,
 }
 
 /// A chosen .upd, read and checked when chosen and again whenever the file changes.
@@ -277,7 +331,7 @@ fn badge(ui: &egui::Ui, center: egui::Pos2, (done, failed): (usize, bool)) {
 }
 
 /// Sizes as the firmware's documents give them: whole MiB, else KiB.
-fn bytes(n: u64) -> String {
+pub fn bytes(n: u64) -> String {
     const MIB: u64 = 1024 * 1024;
     match n {
         n if n >= MIB && n % MIB == 0 => format!("{} MiB", n / MIB),
@@ -334,6 +388,7 @@ fn file_row(ui: &mut egui::Ui, path: Option<&Path>, none: &str) {
 impl App {
     fn new() -> Self {
         let own = Own::new(!cfg!(test));
+        let saved = if cfg!(test) { None } else { remote::saved::load() };
         Self {
             tab: Tab::Cloner,
             tab_chosen: false,
@@ -362,7 +417,190 @@ impl App {
             log_collapsed: false,
             log_seen: 0,
             own,
+            remote: None,
+            conn: ConnMenu {
+                elsewhere: false,
+                remember: true,
+                host: saved.unwrap_or_default(),
+                password: String::new(),
+                connecting: None,
+                reconnecting: None,
+                error: None,
+                open: false,
+                close: false,
+                stuck: false,
+                focus_code: false,
+            },
+            held: Vec::new(),
+            held_rx: None,
+            quit_anyway: false,
         }
+    }
+
+    /// Starts `op` here, or on the host in remote mode.
+    fn start_op<L, M>(&mut self, op: Op, here: L, there: M)
+    where
+        L: FnOnce(&Job) -> Result<String, String> + Send + 'static,
+        M: FnOnce(&Remote, &Job) -> Result<String, String> + Send + 'static,
+    {
+        match self.remote.clone() {
+            Some(r) => self.start(op, move |j| there(&r, j)),
+            None => self.start(op, here),
+        }
+    }
+
+    /// Reads the camera's firmware record, here or there.
+    fn info_reader(&self) -> Box<dyn FnOnce() -> Result<String, String> + Send> {
+        match self.remote.clone() {
+            Some(r) => Box::new(move || r.info()),
+            None => Box::new(camera_info),
+        }
+    }
+
+    /// A/B over the extension unit isn't possible on Windows itself.
+    fn ab_unavailable(&self) -> bool {
+        cfg!(windows) && self.remote.is_none()
+    }
+
+    fn connect_remote(&mut self) {
+        if self.conn.connecting.is_some() || self.busy() {
+            return;
+        }
+        let (host, password) = (self.conn.host.trim().to_string(), self.conn.password.trim().to_string());
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Remote::connect(&host, &password));
+        });
+        self.conn.error = None;
+        self.conn.connecting = Some(rx);
+    }
+
+    /// Switches to the camera on `r`, or (None) to this computer's; whatever
+    /// was open on the other side closes.
+    fn use_remote(&mut self, r: Option<Arc<Remote>>) {
+        if let Some(old) = self.remote.take() {
+            std::thread::spawn(move || old.disconnect());
+        }
+        (self.conn.reconnecting, self.conn.stuck, self.conn.error) = (None, false, None);
+        self.tuning.set_remote(r.clone());
+        self.console.set_remote(r.clone());
+        self.own.set_enabled(r.is_none() && !cfg!(test));
+        (self.cam_info, self.info_rx, self.cloner_up, self.camera_up) = (None, None, false, false);
+        self.last_poll = Instant::now() - Duration::from_secs(10);
+        self.held.clear();
+        match &r {
+            Some(r) => {
+                let h = &r.hello;
+                let name = if r.name.is_empty() || r.name == r.host { String::new() } else { format!(" ({})", r.name) };
+                self.note(Level::Info, format!("Connected to {}{name}: k1cam-flasher {}, {} {}", r.addr, h.version, h.os, h.arch));
+                if self.conn.remember {
+                    if let Err(e) = remote::saved::store(&self.conn.host) {
+                        self.note(Level::Info, format!("The host was not remembered: {e}"));
+                    }
+                } else {
+                    remote::saved::forget();
+                }
+                self.remote = Some(r.clone());
+                self.refresh_held();
+            }
+            None => self.note(Level::Info, "Using the USB devices of this computer"),
+        }
+    }
+
+    /// Asks the host which jobs it keeps: ones still running are followed,
+    /// finished ones reported, and backups not yet saved listed.
+    fn refresh_held(&mut self) {
+        let Some(r) = self.remote.clone() else { return };
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(r.jobs());
+        });
+        self.held_rx = Some(rx);
+    }
+
+    fn poll_remote(&mut self) {
+        if let Some(rx) = &self.conn.connecting {
+            match rx.try_recv() {
+                Ok(Ok(r)) => {
+                    self.conn.connecting = None;
+                    self.conn.close = true;
+                    self.use_remote(Some(r));
+                }
+                Ok(Err(e)) => {
+                    self.conn.connecting = None;
+                    self.conn.error = Some(e);
+                    self.conn.open = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.conn.connecting = None,
+            }
+        }
+        if let Some(rx) = &self.conn.reconnecting {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    self.conn.reconnecting = None;
+                    self.conn.close = true;
+                    if let Some(r) = &self.remote {
+                        self.note(Level::Info, format!("Connected to {} again", r.addr));
+                    }
+                    // A daemon that restarted may hold other jobs now.
+                    self.refresh_held();
+                }
+                Ok(Err(e)) => {
+                    self.conn.reconnecting = None;
+                    self.conn.error = Some(e);
+                    self.conn.focus_code = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.conn.reconnecting = None,
+            }
+        }
+        // A connection that needs the user opens the menu, once: for a new
+        // code (the field emptied, the one it had refused), or to take the
+        // camera back.
+        let link = self.remote.as_ref().map(|r| r.link());
+        let stuck = matches!(link, Some(Link::Refused(_) | Link::Taken(_)));
+        if stuck != std::mem::replace(&mut self.conn.stuck, stuck) && stuck {
+            (self.conn.elsewhere, self.conn.open, self.conn.error) = (true, true, None);
+            if matches!(link, Some(Link::Refused(_))) {
+                self.conn.password.clear();
+                self.conn.focus_code = true;
+            }
+        }
+        let Some(rx) = &self.held_rx else { return };
+        let jobs = match rx.try_recv() {
+            Ok(Ok(jobs)) => jobs,
+            Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                self.held_rx = None;
+                return;
+            }
+            Err(TryRecvError::Empty) => return,
+        };
+        self.held_rx = None;
+        let Some(r) = self.remote.clone() else { return };
+        for j in &jobs {
+            match (&j.done, &j.output) {
+                // Started by an earlier connection: followed from here on.
+                (None, _) if !self.busy() => {
+                    let (r, id) = (r.clone(), j.id.clone());
+                    self.start(Op::from_name(&j.op), move |job| {
+                        job.log(format!("It was started earlier, on {}; following it", r.host));
+                        r.follow(job, &id)?.done.unwrap_or_else(|| Err("no outcome".into()))
+                    });
+                }
+                (Some(outcome), None) => {
+                    let said = match outcome {
+                        Ok(m) => format!("ended: {m}"),
+                        Err(e) => format!("failed: {e}"),
+                    };
+                    self.note(Level::Info, format!("On {}, {} {said}", r.host, Op::from_name(&j.op).title().to_lowercase()));
+                    let (r, id) = (r.clone(), j.id.clone());
+                    std::thread::spawn(move || r.dismiss(&id));
+                }
+                _ => {}
+            }
+        }
+        self.held = jobs.into_iter().filter(|j| j.done.is_some() && j.output.is_some()).collect();
     }
 
     fn busy(&self) -> bool {
@@ -479,10 +717,12 @@ impl App {
         self.job = None;
         // A job may have changed what the camera reports.
         self.cam_info = None;
+        // And a remote one may have left a backup there.
+        self.refresh_held();
     }
 
     /// A valid bundle may read the camera for comparison; other reads need Connect.
-    fn poll_camera_info(&mut self, read: fn() -> Result<String, String>) {
+    fn poll_camera_info(&mut self, read: impl FnOnce() -> Result<String, String> + Send + 'static) {
         if let Some(rx) = &self.info_rx {
             match rx.try_recv() {
                 Ok(r) => {
@@ -505,7 +745,7 @@ impl App {
         self.info_rx.is_some() || self.info_thread.as_ref().is_some_and(|t| !t.is_finished())
     }
 
-    fn read_camera_info(&mut self, read: fn() -> Result<String, String>) {
+    fn read_camera_info(&mut self, read: impl FnOnce() -> Result<String, String> + Send + 'static) {
         if !self.camera_up || self.busy() || self.reading_info() {
             return;
         }
@@ -571,10 +811,11 @@ impl App {
                     .on_hover_text("Checks the link and identifies the flash, without changing it")
                     .clicked()
                 {
-                    self.start(Op::Detect, |j| {
+                    let here = |j: &Job| {
                         let c = cloner::Cloner::probe(j)?;
                         Ok(format!("{}, {} (JEDEC {:06x})", c.name, bytes(c.size as u64), c.jedec))
-                    });
+                    };
+                    self.start_op(Op::Detect, here, |r, j| r.detect(j));
                 }
                 if !self.cloner_up && !self.busy() {
                     line(ui, weak_color(ui), "Waiting for a camera in USB boot mode.")
@@ -592,7 +833,8 @@ impl App {
             ui.horizontal(|ui| {
                 if ui.add_enabled(idle, egui::Button::new("Back up flash…")).clicked() {
                     if let Some(path) = rfd::FileDialog::new().set_file_name(backup_name()).save_file() {
-                        self.start(Op::Backup, move |j| ops::backup(j, &path));
+                        let p = path.clone();
+                        self.start_op(Op::Backup, move |j| ops::backup(j, &p), move |r, j| r.backup(j, &path));
                     }
                 }
                 self.result_line(ui, &[Op::Backup], "No backup yet");
@@ -632,7 +874,8 @@ impl App {
                     let image = image.unwrap();
                     let (b, v, r) = (self.backup_first, self.verify, self.reboot_after);
                     self.confirm = false;
-                    self.start(Op::Flash, move |j| ops::flash(j, &image, b, v, r));
+                    let i = image.clone();
+                    self.start_op(Op::Flash, move |j| ops::flash(j, &i, b, v, r), move |rem, j| rem.flash(j, &image, b, v, r));
                 }
                 self.result_line(ui, &[Op::Flash], "");
             });
@@ -642,22 +885,33 @@ impl App {
     /// Every line on this tab is always there: a bundle fills in its column of
     /// the table, and the long lists open over the page.
     fn update_tab(&mut self, ui: &mut egui::Ui) {
-        if cfg!(windows) {
-            status(ui, warn_color(ui), "Not available on Windows yet; use Linux or macOS, or the cloner on the Backup & Flash tab.");
+        if self.ab_unavailable() {
+            status(
+                ui,
+                warn_color(ui),
+                "Not available on Windows itself; use the camera through a Linux computer (the connection menu, top right), or the cloner on the Backup & Flash tab.",
+            );
             ui.add_space(8.0);
         }
         // Not while the info record is being read: one exchange at a time.
-        let idle = !self.busy() && self.info_rx.is_none() && self.camera_up && !cfg!(windows);
+        let idle = !self.busy() && self.info_rx.is_none() && self.camera_up && !self.ab_unavailable();
         card(ui, "Firmware", |ui| self.firmware_card(ui, idle));
         card(ui, "Backup", |ui| {
             ui.label(
-                RichText::new("Saves the whole flash of the running camera (8 MiB; it takes about three minutes).").color(weak_color(ui)),
+                RichText::new(match &self.remote {
+                    Some(r) => format!(
+                        "Saves the whole flash of the camera on {} (8 MiB; about three minutes) into a file here; the host keeps it until it is saved.",
+                        r.host
+                    ),
+                    None => "Saves the whole flash of the running camera (8 MiB; it takes about three minutes).".into(),
+                })
+                .color(weak_color(ui)),
             );
             ui.horizontal(|ui| {
                 if ui.add_enabled(idle, egui::Button::new("Dump flash…")).clicked() {
                     if let Some(path) = rfd::FileDialog::new().set_file_name(backup_name()).save_file() {
-                        let live = self.live_dump;
-                        self.start(Op::Dump, move |j| ops::dump(j, &path, live));
+                        let (live, p) = (self.live_dump, path.clone());
+                        self.start_op(Op::Dump, move |j| ops::dump(j, &p, live), move |r, j| r.dump(j, &path, live));
                     }
                 }
                 ui.checkbox(&mut self.live_dump, "Live").on_hover_text(
@@ -679,9 +933,10 @@ impl App {
             ui,
             |ui| {
                 let label = if info.is_some() { "Refresh" } else { "Connect" };
-                let can = self.camera_up && !self.busy() && !self.reading_info() && !cfg!(windows);
+                let can = self.camera_up && !self.busy() && !self.reading_info() && !self.ab_unavailable();
                 if ui.add_enabled(can, egui::Button::new(label)).clicked() {
-                    self.read_camera_info(camera_info);
+                    let read = self.info_reader();
+                    self.read_camera_info(read);
                 }
                 if !self.camera_up {
                     line(ui, weak_color(ui), "No camera running k1cam firmware is attached");
@@ -755,10 +1010,10 @@ impl App {
                     .on_hover_text("Withdraw the trial: the camera stays with its confirmed slot")
                     .clicked()
                 {
-                    self.start(Op::Cancel, ops::cancel_trial);
+                    self.start_op(Op::Cancel, ops::cancel_trial, |r, j| r.cancel_trial(j));
                 }
                 if !trial_runs && ui.add_enabled(idle, egui::Button::new("Reboot into trial")).clicked() {
-                    self.start(Op::Reboot, ops::reboot_trial);
+                    self.start_op(Op::Reboot, ops::reboot_trial, |r, j| r.reboot_trial(j));
                 }
             },
         );
@@ -812,7 +1067,8 @@ impl App {
             }
             if ui.add_enabled(can, button).clicked() {
                 let (b, reboot) = (b.clone().unwrap(), self.reboot_trial);
-                self.start(Op::Update, move |j| ops::update(j, &b, reboot));
+                let b2 = b.clone();
+                self.start_op(Op::Update, move |j| ops::update(j, &b, reboot), move |r, j| r.update(j, &b2, reboot));
             }
             self.result_line(ui, &[Op::Update, Op::Reboot, Op::Cancel], "");
         });
@@ -875,6 +1131,36 @@ impl App {
         ui.add_space(6.0);
         ui.label(RichText::new("macOS").strong());
         ui.label("Nothing to install.");
+        ui.add_space(14.0);
+        ui.heading("A camera on another computer");
+        ui.add_space(4.0);
+        ui.label(
+            "The camera can be plugged into another computer running Linux, a Raspberry Pi or a router for example, and used from here over the network. \
+             On that computer, run the daemon (the static command-line builds have it), as a user who can open the camera:",
+        );
+        let daemon = "k1cam-flasher daemon";
+        ui.horizontal_top(|ui| {
+            if ui.small_button("Copy").clicked() {
+                ui.ctx().copy_text(daemon.into());
+            }
+            ui.add(egui::Label::new(RichText::new(daemon).monospace()).wrap());
+        });
+        ui.label(
+            "It takes no options, and prints the addresses to connect to and a code (a new one each time it starts, and after 5 wrong attempts). \
+             In the connection menu at the top right, choose Another computer, and enter one of the addresses and the code.",
+        );
+        ui.label(
+            "Every tab then works on that camera, from any system, Windows included. Files stay here: an image or bundle goes there when \
+             the job starts, and a backup comes back when it ends (the other computer keeps it until it is saved here). A job carries on \
+             there if the connection drops. Tuning shows snapshots instead of live video, and one window controls the camera at a time.",
+        );
+        ui.label(
+            RichText::new(format!(
+                "The connection is plain HTTP on port {}, the code included: use it on a network you trust.",
+                api::PORT
+            ))
+            .color(weak_color(ui)),
+        );
         ui.add_space(14.0);
         ui.heading("About");
         ui.add_space(4.0);
@@ -990,6 +1276,11 @@ impl App {
             Tab::Console => (false, "No camera console found", String::new()),
             Tab::Help => return None,
         })
+        .map(|(up, text, detail)| match &self.remote {
+            Some(r) if detail.is_empty() => (up, text, format!("on {}", r.host)),
+            Some(r) => (up, text, format!("{detail} · on {}", r.host)),
+            None => (up, text, detail),
+        })
     }
 
     /// The tint behind the status bar: blue while a job runs, green while the
@@ -1049,6 +1340,260 @@ impl App {
         );
     }
 
+    /// The connection menu's button: where the camera is, and a dot for how
+    /// the connection is doing.
+    fn connection_button(&mut self, ui: &mut egui::Ui) {
+        let (text, dot) = match (&self.remote, &self.conn.connecting) {
+            (_, Some(_)) => ("Connecting…".to_string(), ui.visuals().hyperlink_color),
+            (None, None) => ("This computer".to_string(), ok_color(ui)),
+            (Some(r), None) => match r.link() {
+                Link::Up => (r.host.clone(), ok_color(ui)),
+                Link::Lost { .. } => (format!("{} · reconnecting", r.host), warn_color(ui)),
+                Link::Taken(_) => (format!("{} · taken over", r.host), err_color(ui)),
+                Link::Refused(_) => (format!("{} · needs the code", r.host), err_color(ui)),
+            },
+        };
+        let icon = egui::IdSalt::new("link-dot");
+        let mut atoms = egui::Atoms::new(text);
+        atoms.push_left(egui::Atom::custom(icon, egui::vec2(10.0, 10.0)));
+        let r = egui::Button::new(atoms).corner_radius(12.0).atom_ui(ui);
+        if let Some(rect) = r.rect(icon) {
+            ui.painter().circle_filled(rect.center(), 4.0, dot);
+        }
+        let resp = r.response.on_hover_text("Where the camera is plugged in: this computer, or another one running k1cam-flasher daemon");
+        if std::mem::take(&mut self.conn.open) {
+            egui::Popup::open_id(ui.ctx(), egui::Popup::default_response_id(&resp));
+        }
+        if std::mem::take(&mut self.conn.close) {
+            egui::Popup::close_id(ui.ctx(), egui::Popup::default_response_id(&resp));
+        }
+        egui::Popup::from_toggle_button_response(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+            ui.set_width(430.0);
+            self.connection_menu(ui);
+        });
+    }
+
+    fn connection_menu(&mut self, ui: &mut egui::Ui) {
+        let weak = weak_color(ui);
+        let busy = self.busy() || self.conn.connecting.is_some() || self.conn.reconnecting.is_some();
+        ui.label(RichText::new("Where the camera is plugged in").strong().size(15.0));
+        ui.add_space(4.0);
+        // What a choice means, under its label.
+        let under = |ui: &mut egui::Ui, text: &str| {
+            ui.horizontal(|ui| {
+                ui.add_space(ui.spacing().icon_width + ui.spacing().icon_spacing);
+                ui.label(RichText::new(text).color(weak));
+            });
+        };
+        let r = ui.add_enabled_ui(!busy, |ui| {
+            if ui.radio(!self.conn.elsewhere, "This computer").clicked() {
+                self.conn.elsewhere = false;
+            }
+            under(ui, "USB devices attached here");
+            if !self.conn.elsewhere && self.remote.is_some() && ui.button("Disconnect and use this computer").clicked() {
+                self.use_remote(None);
+            }
+            if ui.radio(self.conn.elsewhere, "Another computer").clicked() {
+                self.conn.elsewhere = true;
+            }
+            under(ui, "A Linux computer running k1cam-flasher daemon");
+        });
+        r.response.on_disabled_hover_text("Wait for the operation to finish");
+        if self.conn.elsewhere {
+            ui.add_space(4.0);
+            match self.remote.clone() {
+                Some(r) => self.connected_ui(ui, &r),
+                None => self.fields_ui(ui, busy),
+            }
+            ui.add_space(6.0);
+            ui.separator();
+            ui.label(RichText::new("On the other computer, as a user who can open the camera:").color(weak));
+            ui.monospace("# k1cam-flasher daemon");
+        }
+    }
+
+    /// Host and code, and Connect.
+    fn fields_ui(&mut self, ui: &mut egui::Ui, busy: bool) {
+        let weak = weak_color(ui);
+        let mut go = false;
+        egui::Grid::new("remote-fields").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+            ui.label("Host");
+            let hint = "name or address";
+            let r = ui.add_enabled(!busy, egui::TextEdit::singleline(&mut self.conn.host).hint_text(hint).desired_width(300.0));
+            go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.end_row();
+            ui.label("Code");
+            let edit = egui::TextEdit::singleline(&mut self.conn.password).hint_text("as the daemon printed it");
+            let r = ui.add_enabled(!busy, edit.desired_width(300.0));
+            go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.end_row();
+        });
+        ui.checkbox(&mut self.conn.remember, "Remember the host on this computer");
+        let can = !busy && !self.conn.host.trim().is_empty() && !self.conn.password.trim().is_empty();
+        ui.horizontal(|ui| {
+            let label = if self.conn.connecting.is_some() { "Connecting…" } else { "Connect" };
+            go |= ui.add_enabled(can, egui::Button::new(label).fill(ui.visuals().selection.bg_fill)).clicked();
+            if self.conn.connecting.is_some() {
+                ui.spinner();
+                ui.label(RichText::new(format!("Asking {}…", self.conn.host.trim())).color(weak));
+            }
+        });
+        if go && can {
+            self.connect_remote();
+        }
+        if let Some(e) = self.conn.error.clone() {
+            status(ui, warn_color(ui), e);
+        }
+    }
+
+    /// The host this window controls, and letting it go. Refused, a new
+    /// code; taken, taking it back: in place, so that what this window
+    /// follows there (an operation, the console) carries on.
+    fn connected_ui(&mut self, ui: &mut egui::Ui, r: &Arc<Remote>) {
+        let link = r.link();
+        let (color, says) = match &link {
+            Link::Up => (ok_color(ui), format!("Connected to {}", r.addr)),
+            Link::Lost { since, error } => {
+                (warn_color(ui), format!("No answer from {} for {} s: {error}", r.addr, since.elapsed().as_secs()))
+            }
+            Link::Taken(e) | Link::Refused(e) => (err_color(ui), e.clone()),
+        };
+        status(ui, color, says.clone());
+        let h = &r.hello;
+        let name = if r.name.is_empty() || r.name == r.host { String::new() } else { format!(" · it calls itself {}", r.name) };
+        ui.label(RichText::new(format!("k1cam-flasher {} · {} {}{name}", h.version, h.os, h.arch)).color(weak_color(ui)));
+        if matches!(link, Link::Up | Link::Lost { .. }) {
+            ui.label(format!(
+                "This window controls the camera there until you disconnect. If it stops answering, the host frees the camera {} s later; \
+                 an operation that has started keeps running.",
+                api::LEASE_MS / 1000
+            ));
+        }
+        let trying = self.conn.reconnecting.is_some();
+        let mut go = None;
+        match link {
+            Link::Refused(_) => {
+                ui.horizontal(|ui| {
+                    ui.label("Code");
+                    let edit = egui::TextEdit::singleline(&mut self.conn.password).hint_text("from its terminal");
+                    let field = ui.add_enabled(!trying, edit.desired_width(140.0));
+                    if std::mem::take(&mut self.conn.focus_code) {
+                        field.request_focus();
+                    }
+                    let code = self.conn.password.trim().to_string();
+                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let button = egui::Button::new("Use this code").fill(ui.visuals().selection.bg_fill);
+                    if (ui.add_enabled(!trying && !code.is_empty(), button).clicked() || enter) && !code.is_empty() {
+                        go = Some(Some(code));
+                    }
+                });
+            }
+            Link::Taken(_) => {
+                if ui.add_enabled(!trying, egui::Button::new("Connect again")).clicked() {
+                    go = Some(None);
+                }
+            }
+            Link::Up | Link::Lost { .. } => {}
+        }
+        if trying {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new(format!("Asking {}…", r.host)).color(weak_color(ui)));
+            });
+        } else if let Some(e) = self.conn.error.clone().filter(|e| *e != says) {
+            // A code refused again says so above; the field keeps it, to check.
+            status(ui, warn_color(ui), e);
+        }
+        let idle = !self.busy() && !trying;
+        if ui.add_enabled(idle, egui::Button::new("Disconnect")).on_disabled_hover_text("Wait for the operation to finish").clicked() {
+            self.use_remote(None);
+        }
+        if let Some(code) = go {
+            let (tx, rx) = channel();
+            let r = r.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(r.reconnect(code.as_deref()));
+            });
+            self.conn.error = None;
+            self.conn.reconnecting = Some(rx);
+        }
+    }
+
+    /// `--remote HOST`: opens the connection menu with that host, for the
+    /// code its daemon printed.
+    fn open_remote(&mut self, host: &str) {
+        self.conn.host = host.trim().to_string();
+        self.conn.elsewhere = true;
+        self.conn.error = Some(format!("Enter the code the daemon on {} printed.", host.trim()));
+        self.conn.open = true;
+    }
+
+    /// Under the status bar in remote mode: a connection that stopped
+    /// answering, and backups the host keeps that are not saved here.
+    fn remote_banners(&mut self, ui: &mut egui::Ui) {
+        let Some(r) = self.remote.clone() else { return };
+        let fill = ui.visuals().panel_fill.lerp_to_gamma(warn_color(ui), 0.18);
+        let frame = egui::Frame::new().fill(fill).inner_margin(egui::Margin::symmetric(10, 6));
+        let link = r.link();
+        match &link {
+            Link::Up => {}
+            Link::Lost { since, .. } => {
+                let job = if self.busy() {
+                    " The operation carries on there; this window catches up with it once the connection is back."
+                } else {
+                    ""
+                };
+                let text =
+                    format!("Lost the connection to {} {} s ago.{job} Trying again every second.", r.host, since.elapsed().as_secs());
+                egui::Panel::top("link").frame(frame).show(ui, |ui| status(ui, warn_color(ui), text));
+            }
+            Link::Taken(e) | Link::Refused(e) => {
+                let label = if matches!(link, Link::Refused(_)) { "Enter the code…" } else { "Connect again…" };
+                let job = if self.busy() { " The operation carries on there meanwhile." } else { "" };
+                egui::Panel::top("link").frame(frame).show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.small_button(label).clicked() {
+                            self.conn.open = true;
+                        }
+                        ui.label(format!("{e}.{job}"));
+                    });
+                });
+            }
+        }
+        let Some(j) = self.held.first().cloned() else { return };
+        egui::Panel::top("held").frame(frame).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let more = if self.held.len() > 1 { format!(" (and {} more)", self.held.len() - 1) } else { String::new() };
+                let size = j.output.as_ref().map_or(0, |o| o.size);
+                let when = wall_clock(std::time::UNIX_EPOCH + Duration::from_secs(j.started));
+                ui.label(format!(
+                    "{} keeps a backup that isn't saved here: {}, {} from {when}{more}.",
+                    r.host,
+                    Op::from_name(&j.op).title(),
+                    bytes(size)
+                ));
+                let idle = !self.busy();
+                if ui.add_enabled(idle, egui::Button::new("Save…")).clicked() {
+                    if let Some(path) = rfd::FileDialog::new().set_file_name(backup_name()).save_file() {
+                        let (r, id) = (r.clone(), j.id.clone());
+                        self.held.retain(|h| h.id != id);
+                        self.start(Op::Fetch, move |_| r.save_output(&id, &path).map(|sha| format!("{} sha256 {sha}", path.display())));
+                    }
+                }
+                let d = ui.add_enabled(idle, egui::Button::new("Discard…"));
+                egui::Popup::from_toggle_button_response(&d).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                    ui.label(format!("Delete this backup on {}? It isn't saved anywhere else.", r.host));
+                    if ui.button("Delete it").clicked() {
+                        let (r, id) = (r.clone(), j.id.clone());
+                        self.held.retain(|h| h.id != id);
+                        self.note(Level::Info, format!("Discarded the backup {} kept from {when}", r.host));
+                        std::thread::spawn(move || r.dismiss(&id));
+                    }
+                });
+            });
+        });
+    }
+
     /// Files dropped on the window: a .upd for the A/B tab, a .bin to flash.
     fn take_dropped(&mut self, ctx: &egui::Context) {
         if self.busy() {
@@ -1074,7 +1619,7 @@ impl App {
 
     /// Asks before quitting in the middle of a job.
     fn guard_close(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested()) && self.busy() && !self.quit_after {
+        if ctx.input(|i| i.viewport().close_requested()) && self.busy() && !self.quit_after && !self.quit_anyway {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.quit_prompt = true;
         }
@@ -1089,11 +1634,23 @@ impl App {
             ui.set_max_width(400.0);
             ui.heading(format!("{} is running", op.title()));
             ui.add_space(4.0);
-            ui.label(op.risk());
+            match &self.remote {
+                Some(r) => ui.label(format!(
+                    "It runs on {}, and carries on there if this window closes; connecting again later shows how it ended. {}",
+                    r.host,
+                    op.risk()
+                )),
+                None => ui.label(op.risk()),
+            };
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Keep it running").clicked() {
                     self.quit_prompt = false;
+                }
+                if self.remote.is_some() && ui.button("Quit; it carries on there").clicked() {
+                    self.quit_anyway = true;
+                    self.quit_prompt = false;
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if ui.button("Stop it, then quit").clicked() {
                     self.cancel.store(true, Ordering::Relaxed);
@@ -1250,9 +1807,18 @@ impl eframe::App for App {
     /// console and the preview.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain();
+        self.poll_remote();
         if !self.busy() && self.last_poll.elapsed() > Duration::from_secs(1) {
-            self.cloner_up = cloner::device_present();
-            self.camera_up = xu::Camera::present();
+            match &self.remote {
+                Some(r) => {
+                    let s = r.status();
+                    (self.cloner_up, self.camera_up) = (s.cloner, s.camera);
+                }
+                None => {
+                    self.cloner_up = cloner::device_present();
+                    self.camera_up = xu::Camera::present();
+                }
+            }
             if !self.camera_up {
                 self.cam_info = None;
                 self.info_rx = None;
@@ -1269,7 +1835,8 @@ impl eframe::App for App {
             }
             self.last_poll = Instant::now();
         }
-        self.poll_camera_info(camera_info);
+        let read = self.info_reader();
+        self.poll_camera_info(read);
         self.console.poll();
         let shown = self.tab == Tab::Tuning && !ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         if !self.busy() {
@@ -1324,7 +1891,11 @@ impl eframe::App for App {
                     item(ui, Tab::Console, "Console", "The camera's serial console");
                     pick
                 },
-                |ui| help_button(ui, tab == Tab::Help).then_some(Tab::Help),
+                |ui| {
+                    let help = help_button(ui, tab == Tab::Help);
+                    self.connection_button(ui);
+                    help.then_some(Tab::Help)
+                },
             );
             if let Some(t) = left.or(right) {
                 self.tab = t;
@@ -1336,6 +1907,7 @@ impl eframe::App for App {
             let frame = egui::Frame::new().fill(self.status_fill(ui)).inner_margin(egui::Margin::symmetric(10, 6));
             egui::Panel::top("status").frame(frame).show(ui, |ui| self.status_bar(ui));
         }
+        self.remote_banners(ui);
         // The log sits beside the tabs that run jobs.
         if matches!(self.tab, Tab::Cloner | Tab::Update) {
             if self.log_collapsed {
@@ -1451,8 +2023,8 @@ mod tests {
     }
 }
 
-/// The GUI; `args` may name a tab (--tab=update, --tab=tuning, --tab=help, …)
-/// or a .upd to open.
+/// The GUI; `args` may name a tab (--tab=update, --tab=tuning, --tab=help, …),
+/// a .upd to open, or a host to connect to (--remote HOST[:PORT]).
 pub fn run(args: &[String]) -> eframe::Result {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1468,7 +2040,17 @@ pub fn run(args: &[String]) -> eframe::Result {
         Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
             let mut app = App::new();
-            for arg in &args {
+            let mut it = args.iter();
+            while let Some(arg) = it.next() {
+                let host = match arg.strip_prefix("--remote") {
+                    Some("") => it.next().cloned(),
+                    Some(h) => h.strip_prefix('=').map(str::to_string),
+                    None => None,
+                };
+                if let Some(host) = host {
+                    app.open_remote(&host);
+                    continue;
+                }
                 let tab = match arg.as_str() {
                     "--tab=cloner" => Tab::Cloner,
                     "--tab=update" => Tab::Update,
