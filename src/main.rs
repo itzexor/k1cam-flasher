@@ -10,6 +10,8 @@ mod gui;
 mod job;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod lock;
 mod ops;
 #[cfg(feature = "gui")]
 mod overlay;

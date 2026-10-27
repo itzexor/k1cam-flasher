@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -120,6 +120,46 @@ struct App {
     /// how many of its lines have been seen.
     log_collapsed: bool,
     log_seen: usize,
+    own: Own,
+}
+
+/// This computer's flasher lock (lock.rs), held while the GUI uses the camera
+/// here: a job, an info read, tuning or the console; let go once none does.
+/// In remote mode the host's daemon holds its own.
+#[derive(Clone, Default)]
+pub struct Own(Arc<Mutex<OwnState>>);
+
+#[derive(Default)]
+struct OwnState {
+    enabled: bool,
+    #[cfg(target_os = "linux")]
+    lock: Option<crate::lock::Lock>,
+}
+
+impl Own {
+    /// `Own::default()` takes nothing (for tests).
+    fn new(enabled: bool) -> Self {
+        Self(Arc::new(Mutex::new(OwnState { enabled, ..Default::default() })))
+    }
+
+    pub fn hold(&self) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut s = self.0.lock().unwrap();
+            if s.enabled && s.lock.is_none() {
+                s.lock = Some(crate::lock::acquire(format!("k1cam-flasher GUI (pid {})", std::process::id()))?);
+            }
+        }
+        Ok(())
+    }
+
+    fn release(&self) {
+        #[cfg(target_os = "linux")]
+        {
+            self.0.lock().unwrap().lock = None;
+        }
+    }
+
 }
 
 /// A chosen .upd, read and checked when chosen and again whenever the file changes.
@@ -293,6 +333,7 @@ fn file_row(ui: &mut egui::Ui, path: Option<&Path>, none: &str) {
 
 impl App {
     fn new() -> Self {
+        let own = Own::new(!cfg!(test));
         Self {
             tab: Tab::Cloner,
             tab_chosen: false,
@@ -314,12 +355,13 @@ impl App {
             cam_info: None,
             info_rx: None,
             info_thread: None,
-            console: console::Console::new(),
-            tuning: tuning::Tuning::new(),
+            console: console::Console::new(own.clone()),
+            tuning: tuning::Tuning::new(own.clone()),
             quit_prompt: false,
             quit_after: false,
             log_collapsed: false,
             log_seen: 0,
+            own,
         }
     }
 
@@ -361,6 +403,13 @@ impl App {
         F: FnOnce(&Job) -> Result<String, String> + Send + 'static,
     {
         if self.busy() {
+            return;
+        }
+        // Here, this computer's flashers take turns with the camera.
+        if let Err(e) = self.own.hold() {
+            self.note(Level::Start, op.title());
+            self.note(Level::Failed, e.clone());
+            self.results.insert(op, Err(e));
             return;
         }
         let mut threads = self.tuning.stop();
@@ -458,6 +507,10 @@ impl App {
 
     fn read_camera_info(&mut self, read: fn() -> Result<String, String>) {
         if !self.camera_up || self.busy() || self.reading_info() {
+            return;
+        }
+        if let Err(e) = self.own.hold() {
+            self.cam_info = Some(Err(e));
             return;
         }
         let (tx, rx) = channel();
@@ -702,10 +755,10 @@ impl App {
                     .on_hover_text("Withdraw the trial: the camera stays with its confirmed slot")
                     .clicked()
                 {
-                    self.start(Op::Cancel, |_| xu::Camera::open()?.cancel_trial().map(|_| "trial cancelled".into()));
+                    self.start(Op::Cancel, ops::cancel_trial);
                 }
                 if !trial_runs && ui.add_enabled(idle, egui::Button::new("Reboot into trial")).clicked() {
-                    self.start(Op::Reboot, |_| xu::Camera::open()?.reboot().map(|_| "rebooting into the trial".into()));
+                    self.start(Op::Reboot, ops::reboot_trial);
                 }
             },
         );
@@ -1227,6 +1280,10 @@ impl eframe::App for App {
                 Some(e) => self.note(Level::Failed, e),
                 None => self.note(Level::Info, l),
             }
+        }
+        // This computer's camera is let go once nothing here uses it.
+        if !(self.busy() || self.reading_info() || self.tuning.in_use() || self.console.in_use()) {
+            self.own.release();
         }
         ctx.request_repaint_after(Duration::from_millis(250));
     }

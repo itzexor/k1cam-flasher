@@ -92,6 +92,8 @@ k1cam-flasher check k1cam.upd           # what a bundle holds, no camera needed
 
 `flash` backs up next to the image, verifies and reboots unless told not to (`--no-backup`, `--no-verify`, `--no-reboot`); `update --no-reboot` only stages. Progress and messages go to stderr, results to stdout; the exit status is 0 on success, 1 on failure and 2 for usage errors. Output files are never overwritten. Ctrl-C stops an operation cleanly (a dump or upload ends its session on the camera); a second Ctrl-C quits at once.
 
+On Linux, one k1cam-flasher at a time uses the camera: a command, the GUI (while it runs a job, reads the camera's information, tunes or has the console open) or the daemon (while a GUI controls it or a job runs). The others are told which one has it, e.g. `the camera is in use by k1cam-flasher daemon (pid 812), controlled from alex@studio (10.0.0.20)`. Firmware operations also refuse to start while another program has the camera's video node open, and name it; nothing is stopped for you.
+
 ## Static builds
 
 Without the GUI (`--no-default-features`) the flasher is about 1 MiB and depends on nothing but Rust's standard library: on Linux it talks to usbfs and V4L2 itself instead of using libusb, so it links statically for musl targets with no C cross toolchain. `.cargo/config.toml` links the ARM targets with the `rust-lld` that ships with Rust.

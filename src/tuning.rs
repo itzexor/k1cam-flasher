@@ -425,6 +425,7 @@ struct Shown {
 }
 
 pub struct Tuning {
+    own: crate::gui::Own,
     connected: bool,
     node: Option<PathBuf>,
     scanned: Option<Instant>,
@@ -461,8 +462,9 @@ const HINTS: [&str; 3] = [
 ];
 
 impl Tuning {
-    pub fn new() -> Self {
+    pub fn new(own: crate::gui::Own) -> Self {
         Self {
+            own,
             connected: false,
             node: None,
             scanned: None,
@@ -486,6 +488,11 @@ impl Tuning {
             measured: None,
             mask: None,
         }
+    }
+
+    /// Connected, or its threads are still letting go of the camera.
+    pub fn in_use(&self) -> bool {
+        self.connected || !self.retiring.is_empty()
     }
 
     /// Lines for the app's log (saved snapshots, resets).
@@ -717,8 +724,10 @@ impl Tuning {
         ui.horizontal(|ui| {
             if !self.connected {
                 if ui.add_enabled(self.retiring.is_empty(), egui::Button::new("Connect")).clicked() {
-                    self.connected = true;
-                    self.retry = Instant::now();
+                    match self.own.hold() {
+                        Ok(()) => { self.connected = true; self.retry = Instant::now(); }
+                        Err(e) => self.note = e,
+                    }
                 }
                 ui.label(RichText::new("to preview the camera and change its image controls").color(ui.visuals().weak_text_color()));
                 return;
@@ -1157,7 +1166,7 @@ mod tests {
 
     #[test]
     fn attachment_and_tab_selection_do_not_start_tuning() {
-        let mut tuning = Tuning::new();
+        let mut tuning = Tuning::new(crate::gui::Own::default());
         tuning.poll(&egui::Context::default(), true, true);
         assert!(tuning.node.is_none());
         assert!(tuning.stream.is_none());
@@ -1172,7 +1181,7 @@ mod tests {
 
     #[test]
     fn stopping_tuning_signals_and_returns_every_device_thread() {
-        let mut tuning = Tuning::new();
+        let mut tuning = Tuning::new(crate::gui::Own::default());
         tuning.connected = true;
         let capture_stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::new(AtomicBool::new(false));
@@ -1207,7 +1216,7 @@ mod tests {
 
     /// The real lines, as before the camera says which controls it has.
     fn real() -> Vec<Line> {
-        Tuning::new().lines().iter().map(|&(g, c)| Line { group: g as usize, heading: c.is_none() }).collect()
+        Tuning::new(crate::gui::Own::default()).lines().iter().map(|&(g, c)| Line { group: g as usize, heading: c.is_none() }).collect()
     }
 
     /// The preview at the top left in its aspect. Every line placed once, in

@@ -227,6 +227,7 @@ fn run_port(name: String, out: Receiver<Vec<u8>>, tx: Sender<Msg>, stop: Arc<Ato
 }
 
 pub struct Console {
+    own: crate::gui::Own,
     port: Option<String>,
     conn: Option<Conn>,
     /// The old port must finish closing before another connection or a job.
@@ -248,8 +249,9 @@ fn find_port() -> Option<String> {
 }
 
 impl Console {
-    pub fn new() -> Self {
+    pub fn new(own: crate::gui::Own) -> Self {
         Self {
+            own,
             port: None,
             conn: None,
             closing: None,
@@ -265,6 +267,11 @@ impl Console {
     /// The camera's console port is there, open or not.
     pub fn found(&self) -> bool {
         self.port.is_some()
+    }
+
+    /// Open, opening, or still closing.
+    pub fn in_use(&self) -> bool {
+        self.conn.is_some() || self.closing.is_some()
     }
 
     pub fn connected(&self) -> bool {
@@ -346,6 +353,10 @@ impl Console {
                 self.note = format!("{name} is open in {}; not connecting so that it keeps its output", users.join(", "));
                 return;
             }
+        }
+        if let Err(e) = self.own.hold() {
+            self.note = e;
+            return;
         }
         let (tx, rx) = channel();
         let (out, out_rx) = channel();
@@ -508,7 +519,7 @@ mod tests {
         assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) }, 0);
         let name = std::fs::read_link(format!("/proc/self/fd/{slave}")).unwrap().to_string_lossy().into_owned();
         let (_master, _slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-        let mut console = Console::new();
+        let mut console = Console::new(crate::gui::Own::default());
         console.port = Some(name.clone());
         console.scanned = Some(Instant::now());
         console.poll();

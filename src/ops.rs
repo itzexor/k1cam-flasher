@@ -73,14 +73,40 @@ pub fn flash_data(j: &Job, data: &[u8], backup: Option<&Path>, verify: bool, reb
 }
 
 pub fn dump(j: &Job, path: &Path, live: bool) -> Result<String, String> {
+    alone()?;
     let (data, consistency) = xu::Camera::open()?.dump(j, live)?;
     std::fs::write(path, &data).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(format!("{} ({consistency}), sha256 {}", path.display(), xu::hex(&Sha256::digest(&data))))
 }
 
 pub fn update(j: &Job, b: &Bundle, reboot: bool) -> Result<String, String> {
+    alone()?;
     j.log(format!("Bundle {} ({} bytes)", b.build, b.data.len()));
     xu::Camera::open()?.upgrade(j, b, reboot)
+}
+
+pub fn reboot_trial(_: &Job) -> Result<String, String> {
+    alone()?;
+    xu::Camera::open()?.reboot().map(|_| "rebooting into the trial".into())
+}
+
+pub fn cancel_trial(_: &Job) -> Result<String, String> {
+    alone()?;
+    xu::Camera::open()?.cancel_trial().map(|_| "trial cancelled".into())
+}
+
+/// The firmware protocol is one exchange at a time: a program that has the
+/// camera's video open may be in the middle of its own (uvcdctl), or streaming
+/// from a camera about to reboot. It is named, never stopped.
+fn alone() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if let Some(node) = crate::v4l2::node() {
+        let users = crate::linux::device_users(&node.to_string_lossy());
+        if !users.is_empty() {
+            return Err(format!("{} is in use by {}; close it first", node.display(), users.join(", ")));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

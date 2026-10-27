@@ -134,6 +134,10 @@ pub struct UsbDevice {
 impl UsbDevice {
     pub fn open(vid: u16, pid: u16) -> R<Self> {
         let (dir, node) = find_usb(&[(vid, pid)]).ok_or("device not found")?;
+        let users = device_users(&node.to_string_lossy());
+        if !users.is_empty() {
+            return Err(format!("{} is in use by {}", node.display(), users.join(", ")));
+        }
         let f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)

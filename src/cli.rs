@@ -78,6 +78,15 @@ pub fn run(args: &[String]) -> Option<i32> {
     if matches!(cmd, "detect" | "backup" | "flash") && !cloner::device_present() {
         return Some(report(Err("no camera in USB boot mode is attached (USB a108:c309); see the README".into())));
     }
+    // One flasher at a time drives the camera here (a GUI, the daemon, another command).
+    #[cfg(target_os = "linux")]
+    let _lock = match cmd {
+        "check" => None,
+        _ => match crate::lock::acquire(format!("k1cam-flasher {cmd} (pid {})", std::process::id())) {
+            Ok(l) => Some(l),
+            Err(e) => return Some(report(Err(e))),
+        },
+    };
     let file = files.first().map(PathBuf::from).unwrap_or_default();
     Some(match cmd {
         "info" | "--info" => report(xu::Camera::open().and_then(|mut c| c.info())),
@@ -89,8 +98,8 @@ pub fn run(args: &[String]) -> Option<i32> {
             }
             Err(e) => report(Err(e)),
         },
-        "reboot" => run_job(|_| xu::Camera::open()?.reboot().map(|_| "rebooting into the trial".into())),
-        "cancel" => run_job(|_| xu::Camera::open()?.cancel_trial().map(|_| "cancelled".into())),
+        "reboot" => run_job(ops::reboot_trial),
+        "cancel" => run_job(ops::cancel_trial),
         "dump" => match new_file(&file) {
             Ok(()) => {
                 let live = has("--live");
