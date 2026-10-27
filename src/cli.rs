@@ -34,6 +34,11 @@ With the cloner, on a camera in USB boot mode (boot ROM, a108:c309; see the READ
                           the settings (backs it up next to FILE.bin first)
 
   check FILE.upd          verify a bundle and print what it holds
+
+  daemon                  serve the camera attached here to a GUI on another
+                          computer (Linux, port 19249); prints the password
+                          to connect with, a new one after 5 wrong attempts.
+                          Ctrl-C waits for a running job.
 ";
 
 /// Runs the command in `args` and returns the exit status, or None when `args`
@@ -45,6 +50,15 @@ pub fn run(args: &[String]) -> Option<i32> {
     };
     if gui && (cmd.starts_with("--tab=") || cmd.ends_with(".upd")) {
         return None;
+    }
+    if cmd == "daemon" {
+        #[cfg(target_os = "linux")]
+        return Some(crate::daemon::run(&args[1..]));
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("k1cam-flasher: the daemon runs on Linux only");
+            return Some(2);
+        }
     }
     let (opts, files): (Vec<&str>, Vec<&str>) = args[1..].iter().map(String::as_str).partition(|a| a.starts_with("--"));
     let allowed: &[&str] = match cmd {

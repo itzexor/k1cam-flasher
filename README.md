@@ -88,6 +88,7 @@ k1cam-flasher detect                    # cloner: identify the flash chip
 k1cam-flasher backup backup.bin         # cloner: read the whole flash
 k1cam-flasher flash k1cam.bin --yes     # cloner: replace the whole flash
 k1cam-flasher check k1cam.upd           # what a bundle holds, no camera needed
+k1cam-flasher daemon --token-file FILE  # serve this camera over HTTP on Linux
 ```
 
 `flash` backs up next to the image, verifies and reboots unless told not to (`--no-backup`, `--no-verify`, `--no-reboot`); `update --no-reboot` only stages. Progress and messages go to stderr, results to stdout; the exit status is 0 on success, 1 on failure and 2 for usage errors. Output files are never overwritten. Ctrl-C stops an operation cleanly (a dump or upload ends its session on the camera); a second Ctrl-C quits at once.

@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: MIT
+#[cfg(any(feature = "gui", target_os = "linux"))]
+mod api;
 mod bundle;
 mod cli;
 mod cloner;
-mod controls;
 #[cfg(feature = "gui")]
 mod console;
+mod controls;
+#[cfg(target_os = "linux")]
+mod daemon;
 #[cfg(feature = "gui")]
 mod gui;
+#[cfg(any(feature = "gui", target_os = "linux"))]
+mod http;
 mod job;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -15,6 +21,8 @@ mod lock;
 mod ops;
 #[cfg(feature = "gui")]
 mod overlay;
+#[cfg(target_os = "linux")]
+mod serial;
 #[cfg(feature = "gui")]
 mod tuning;
 mod usb;
