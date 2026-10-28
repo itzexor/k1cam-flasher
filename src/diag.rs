@@ -243,3 +243,13 @@ pub mod tests {
         assert!(read(|_, _, _| Err(std::io::Error::from_raw_os_error(5))).is_err());
     }
 }
+
+/// Snapshot headers use hex to keep the JPEG body and old clients unchanged.
+#[cfg(feature = "gui")]
+pub fn from_hex(s: &str) -> Result<Snapshot, String> {
+    if s.len() % 2 != 0 || s.len() > 32 * 56 * 2 {
+        return Err("invalid snapshot diagnostics".into());
+    }
+    let bytes: Option<Vec<u8>> = s.as_bytes().chunks_exact(2).map(|p| std::str::from_utf8(p).ok().and_then(|p| u8::from_str_radix(p, 16).ok())).collect();
+    Snapshot::parse(&bytes.ok_or("invalid snapshot diagnostics")?)
+}

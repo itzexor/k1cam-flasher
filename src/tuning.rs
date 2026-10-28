@@ -140,12 +140,14 @@ fn capture(
 }
 
 enum Req {
+    Diagnostic,
     Load,
     Set(usize, i32),
     Reset,
 }
 
 enum Resp {
+    Diagnostic(Result<Option<Vec<u8>>, String>),
     /// The MJPEG frame sizes the camera offers.
     Sizes(Result<Vec<(u32, u32)>, String>),
     Loaded(Result<Vec<Option<Value>>, String>),
@@ -183,8 +185,18 @@ fn worker(open: OpenTuner, rx: Receiver<Req>, tx: Sender<Resp>, stop: Arc<Atomic
     let _ = tx.send(Resp::Sizes(ctl.sizes()));
     // The controls an automatic mode sets (inactive ones), followed while `watch` is set.
     let mut auto: Vec<usize> = Vec::new();
+    let mut live_at = Instant::now();
     loop {
-        let first = match rx.recv_timeout(LIVE) {
+        if stop.load(Ordering::Relaxed) { break; }
+        // Diagnostic requests must not starve the once-a-second automatic controls.
+        if live_at.elapsed() >= LIVE {
+            if watch.load(Ordering::Relaxed) && !auto.is_empty() {
+                let _ = tx.send(Resp::Live(ctl.get(&auto)));
+                ctx.request_repaint();
+            }
+            live_at = Instant::now();
+        }
+        let first = match rx.recv_timeout(LIVE.saturating_sub(live_at.elapsed())) {
             Ok(r) => Some(r),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => break,
@@ -192,17 +204,13 @@ fn worker(open: OpenTuner, rx: Receiver<Req>, tx: Sender<Resp>, stop: Arc<Atomic
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let Some(first) = first else {
-            if watch.load(Ordering::Relaxed) && !auto.is_empty() {
-                let _ = tx.send(Resp::Live(ctl.get(&auto)));
-                ctx.request_repaint();
-            }
-            continue;
-        };
+        let Some(first) = first else { continue };
         // Only the newest value of each control matters (a slider sends many).
         let (mut load, mut reset, mut sets) = (false, false, Vec::<(usize, i32)>::new());
+        let mut diagnostic = false;
         for r in std::iter::once(first).chain(rx.try_iter()) {
             match r {
+                Req::Diagnostic => diagnostic = true,
                 Req::Load => load = true,
                 Req::Reset => reset = true,
                 Req::Set(i, v) => {
@@ -230,6 +238,9 @@ fn worker(open: OpenTuner, rx: Receiver<Req>, tx: Sender<Resp>, stop: Arc<Atomic
                 auto = (0..vals.len()).filter(|&i| vals[i].is_some_and(|v| v.inactive)).collect();
             }
             let _ = tx.send(Resp::Loaded(r));
+        }
+        if diagnostic && !stop.load(Ordering::Relaxed) {
+            let _ = tx.send(Resp::Diagnostic(ctl.diagnostic()));
         }
         ctx.request_repaint();
     }
@@ -479,6 +490,11 @@ pub struct Tuning {
     overlays: Overlays,
     measured: Option<Measured>,
     mask: Option<egui::TextureHandle>,
+    diagnostic: Option<(Instant, crate::diag::Snapshot)>,
+    diag_asked: Option<Instant>,
+    diag_pending: bool,
+    diag_supported: bool,
+    diag_error: Option<String>,
 }
 
 const RATES: [u32; 6] = [30, 25, 20, 15, 10, 5];
@@ -526,6 +542,11 @@ impl Tuning {
             overlays: Overlays::default(),
             measured: None,
             mask: None,
+            diagnostic: None,
+            diag_asked: None,
+            diag_pending: false,
+            diag_supported: true,
+            diag_error: None,
         }
     }
 
@@ -578,6 +599,14 @@ impl Tuning {
                         Some(t) => t.set(image.clone(), opts),
                         None => self.texture = Some(ctx.load_texture("preview", image.clone(), opts)),
                     }
+                    self.diagnostic = None;
+                    if let Some(diagnostic) = snap.diagnostic {
+                        match diagnostic {
+                            Ok(Some(d)) => { self.diagnostic = Some((Instant::now(), d)); self.diag_error = None; self.diag_supported = true; },
+                            Ok(None) => { self.diag_supported = false; self.diag_error = None; },
+                            Err(e) => self.diag_error = Some(e),
+                        }
+                    }
                     self.seq = snap.seq;
                     let at = Instant::now().checked_sub(snap.age).unwrap_or_else(Instant::now);
                     self.shown = Some(Shown { jpeg: snap.jpeg, image, fps: 0.0, at });
@@ -618,8 +647,9 @@ impl Tuning {
         }
         let (tx, rx) = channel();
         let (size, after, ctx) = (self.size, if auto { self.seq } else { 0 }, ctx.clone());
+        let diagnostic = self.overlays.metering || self.overlays.clipping || self.overlays.histogram;
         self.snapshot_thread = Some(std::thread::spawn(move || {
-            let got = r.snapshot(size, auto, after).and_then(|s| {
+            let got = r.snapshot(size, auto, after, diagnostic).and_then(|s| {
                 let image = decode(&s.jpeg).ok_or("the snapshot is not a whole JPEG")?;
                 Ok((s, Arc::new(image)))
             });
@@ -688,6 +718,8 @@ impl Tuning {
     }
 
     fn retire_worker(&mut self) {
+        self.diag_pending = false;
+        self.diagnostic = None;
         if let Some(mut w) = self.worker.take() {
             w.stop.store(true, Ordering::Relaxed);
             if let Some(t) = w.thread.take() {
@@ -707,6 +739,11 @@ impl Tuning {
         self.changed = None;
         self.frozen.clear();
         self.connected = false;
+        self.diagnostic = None;
+        self.diag_asked = None;
+        self.diag_pending = false;
+        self.diag_supported = true;
+        self.diag_error = None;
         self.retire();
         self.retire_worker();
         if let Some(t) = self.snapshot_thread.take() {
@@ -769,10 +806,28 @@ impl Tuning {
             }
         }
         let Some(w) = &self.worker else { return };
+        // Remote previews carry a sample captured while their stream was open.
+        let need_diag = visible && self.remote.is_none() &&
+            (self.overlays.metering || self.overlays.clipping || self.overlays.histogram);
+        let interval = if self.diag_error.is_some() { Duration::from_secs(2) } else { AUTO_EVERY };
+        if need_diag && self.diag_supported && !self.diag_pending && self.diag_asked.is_none_or(|t| t.elapsed() >= interval) {
+            self.diag_pending = w.tx.send(Req::Diagnostic).is_ok();
+            self.diag_asked = Some(Instant::now());
+        }
+        if need_diag { ctx.request_repaint_after(AUTO_EVERY); }
         w.watch.store(visible, Ordering::Relaxed);
         let (mut lost, mut restart) = (false, false);
         loop {
             match w.rx.try_recv() {
+                Ok(Resp::Diagnostic(r)) => {
+                    self.diag_pending = false;
+                    let r = r.and_then(|r| r.map(|r| crate::diag::Snapshot::parse(&r)).transpose());
+                    match r {
+                        Ok(Some(d)) => { self.diagnostic = Some((Instant::now(), d)); self.diag_error = None; },
+                        Ok(None) => { self.diag_supported = false; self.diagnostic = None; },
+                        Err(e) => { self.diag_error = Some(e); self.diagnostic = None; },
+                    }
+                }
                 Ok(Resp::Sizes(Ok(sizes))) => {
                     if !sizes.contains(&self.size) {
                         self.size = sizes[0];
@@ -1099,7 +1154,11 @@ impl Tuning {
         let o = &self.overlays;
         let (zoom, pan, tilt) =
             (self.view_value("zoom").unwrap_or(100), self.view_value("pan").unwrap_or(0), self.view_value("tilt").unwrap_or(0));
-        let view = overlay::View::new(image.size, zoom, pan, tilt);
+        let diagnostic = self.diagnostic.as_ref().filter(|(t, _)| self.remote.is_some() ||
+            (t.elapsed() < Duration::from_millis(1500) && at.elapsed() < Duration::from_millis(1500)));
+        let d = diagnostic.map(|(_, d)| d);
+        let view = d.filter(|d| d.has(8)).map(overlay::View::diagnostic)
+            .unwrap_or_else(|| overlay::View::new(image.size, zoom, pan, tilt));
         if !(o.metering || o.clipping || o.histogram) {
             if o.grid {
                 overlay::draw_grid(p, rect);
@@ -1119,6 +1178,33 @@ impl Tuning {
         }
         let Some(Measured { m, .. }) = &self.measured else { return };
         let mut legend = Vec::new();
+        if let Some((t, d)) = diagnostic {
+            let label = if self.remote.is_some() { "ISP at snapshot" } else { "ISP snapshot" };
+            legend.push(vec![Item::Text(format!("{label} #{} · {} ms old", d.sequence, t.elapsed().as_millis()))]);
+            if d.has(2) {
+                legend.push(vec![Item::Text(format!("Exposure {:.2} ms · gain {:.2}×", d.exposure_us as f32 / 1000.0,
+                    d.gain_x256 as f32 / 256.0))]);
+            }
+            let mut details = Vec::new();
+            if d.has(4) { details.push(format!("WB {} K", d.awb_kelvin)); }
+            if d.has(8) { details.push(format!("View {:.2}× · rotation {}°", f32::from(d.zoom) / 100.0, d.rotation)); }
+            if !details.is_empty() { legend.push(vec![Item::Text(details.join(" · "))]); }
+            if d.has(1) {
+                legend.push(vec![Item::Text(format!("AE target {} · mean {} · {}", d.target, d.mean,
+                    if d.flags & 1 != 0 { "settled" } else { "adjusting" }))]);
+            }
+            if d.has(128) {
+                legend.push(vec![Item::Text(format!("Compensation {} requested · {} applied", d.requested, d.applied))]);
+            }
+            if d.has(256) {
+                legend.push(vec![Item::Text(format!("Guard top 1%: bin {} · {:.1} in view · cut {:.0}%",
+                    d.guard_top, d.guard_level, d.guard_cut * 100.0))]);
+            }
+        } else {
+            let why = if self.diag_error.is_some() { "diagnostic read failed" }
+                else if !self.diag_supported { "diagnostics unavailable" } else { "no recent ISP snapshot" };
+            legend.push(vec![Item::Text(format!("Picture estimates · {why}"))]);
+        }
         if let (true, Some(mask)) = (o.clipping, &self.mask) {
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             p.image(mask.id(), rect, uv, egui::Color32::WHITE);
@@ -1129,17 +1215,22 @@ impl Tuning {
             overlay::draw_grid(p, rect);
         }
         if o.metering {
-            let mode = self.view_value("metering").and_then(Metering::from_value);
-            let (slices, [min, median, max]) = overlay::slices(&m.zones);
+            let isp = d.filter(|d| d.has(8 | 16 | 32));
+            let mode = isp.and_then(|d| Metering::from_value(i32::from(d.metering)))
+                .or_else(|| self.view_value("metering").and_then(Metering::from_value));
+            let zones = isp.map(|d| overlay::diagnostic_zones(d, &view));
+            let (slices, [min, median, max]) = overlay::slices(zones.as_ref().unwrap_or(&m.zones));
             let none = overlay::Grid::<bool>::default();
-            let (weights, marked) = match mode {
+            let (weights, marked) = if let Some(d) = isp {
+                (Some(d.weights), none)
+            } else { match mode {
                 Some(Metering::Subject) => {
                     let (w, marked) = overlay::subject(&view, &overlay::linear(&m.zones));
                     (Some(w), marked)
                 }
                 Some(Metering::Tuning) | None => (None, none),
                 Some(mode) => (Some(overlay::weights(&view, mode)), none),
-            };
+            }};
             overlay::draw_metering(p, rect, &view, weights.as_ref(), &slices, &marked, mode == Some(Metering::Spot));
             let mut name = match mode {
                 Some(Metering::Tuning) => "tuning default, whose weights the camera doesn't report",
@@ -1150,9 +1241,15 @@ impl Tuning {
                 None => "not reported by this camera",
             }
             .to_string();
-            if self.view_value("auto-exposure") == Some(1) {
+            if isp.is_some() { name = format!("{} (ISP weights and linear levels)", match mode {
+                Some(Metering::Tuning) => "tuning default", Some(Metering::Average) => "average",
+                Some(Metering::Center) => "center-weighted", Some(Metering::Spot) => "spot",
+                Some(Metering::Subject) => "subject", None => "unknown",
+            }); }
+            if isp.map(|d| d.flags & 2 == 0).unwrap_or_else(|| self.view_value("auto-exposure") == Some(1)) {
                 name += "; unused, as exposure is manual";
             }
+            if isp.is_none() { name += " (picture estimate)"; }
             legend.push(vec![Item::Text(format!("Metering: {name}"))]);
             let size = if weights.is_some() { "Dot size: zone weight" } else { "Rings: weight unknown" };
             legend.push(vec![Item::Text(format!("{size}  ·  colour: zone brightness"))]);
@@ -1171,9 +1268,18 @@ impl Tuning {
         if o.histogram {
             let width = (rect.width() * 0.3).clamp(100.0, 256.0);
             let size = egui::vec2(width, width * 0.4);
-            overlay::draw_histogram(p, egui::Rect::from_min_size(rect.right_bottom() - size - egui::vec2(6.0, 6.0), size), &m.hist);
-            let (median, top) = (overlay::level(&m.hist, 0.5), overlay::level(&m.hist, 0.01));
-            legend.push(vec![Item::Text(format!("Luma: median {median} (white)  ·  brightest 1% from {top} (yellow)"))]);
+            let area = egui::Rect::from_min_size(rect.right_bottom() - size - egui::vec2(6.0, 6.0), size);
+            let isp = d.filter(|d| d.has(64));
+            let hist = isp.map(|d| std::array::from_fn(|i| u32::from(d.hist[i/4])));
+            let hist = hist.as_ref().unwrap_or(&m.hist);
+            overlay::draw_histogram(p, area, hist, isp.is_some());
+            let (median, top) = (overlay::level(hist, 0.5), overlay::level(hist, 0.01));
+            legend.push(vec![Item::Text(format!("{}: median {median} (white) · top 1% from {top} (yellow)",
+                if isp.is_some() { "ISP linear histogram, whole sensor" } else { "Picture luma estimate" }))]);
+            if let Some(d) = isp {
+                overlay::draw_guard(p, area, d);
+                legend.push(vec![Item::Text("Red: guard threshold 200 · green: last guard level in view".into())]);
+            }
         }
         if !legend.is_empty() {
             overlay::draw_legend(p, rect.min + egui::vec2(6.0, 6.0), &legend);
@@ -1405,6 +1511,33 @@ fn heading(ui: &egui::Ui, rect: egui::Rect, g: Group, again: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_do_not_starve_live_auto_controls() {
+        use std::sync::atomic::AtomicUsize;
+        struct Fake(Arc<AtomicUsize>);
+        impl Tuner for Fake {
+            fn sizes(&self) -> Result<Vec<(u32,u32)>, String> { Ok(vec![(1920,1080)]) }
+            fn load(&self) -> Result<Vec<Option<Value>>, String> {
+                Ok(vec![Some(Value { value: 1, min: 0, max: 255, step: 1, default: 1, inactive: true })])
+            }
+            fn set(&self, _: usize, v: i32) -> Result<i32, String> { Ok(v) }
+            fn get(&self, _: &[usize]) -> Vec<(usize,i32)> { self.0.fetch_add(1, Ordering::Relaxed); vec![(0,42)] }
+            fn reset(&self) -> Result<(), String> { Ok(()) }
+        }
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reads2 = reads.clone();
+        let (tx, rx) = channel(); let (out, answers) = channel();
+        let stop = Arc::new(AtomicBool::new(false)); let stop2 = stop.clone();
+        let thread = std::thread::spawn(move || worker(Box::new(move || Ok(Box::new(Fake(reads2)))), rx, out,
+            stop2, Arc::new(AtomicBool::new(true)), egui::Context::default()));
+        tx.send(Req::Load).unwrap();
+        // Keep the worker busier than its previous idle timeout for over a second.
+        for _ in 0..12 { tx.send(Req::Diagnostic).unwrap(); std::thread::sleep(Duration::from_millis(100)); }
+        stop.store(true, Ordering::Relaxed); drop(tx); thread.join().unwrap();
+        assert!(reads.load(Ordering::Relaxed) >= 1);
+        assert!(answers.try_iter().any(|r| matches!(r, Resp::Live(_))));
+    }
 
     #[test]
     fn attachment_and_tab_selection_do_not_start_tuning() {

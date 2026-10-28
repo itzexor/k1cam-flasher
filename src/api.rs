@@ -16,6 +16,8 @@ pub const SESSION: &str = "K1cam-Session";
 /// A snapshot's sequence number, age in milliseconds, and size.
 pub const SEQ: &str = "K1cam-Seq";
 pub const AGE: &str = "K1cam-Age-Ms";
+/// Optional snapshot diagnostic record, hex encoded; "error" on a failed read.
+pub const DIAGNOSTIC: &str = "K1cam-Diagnostic";
 #[cfg(target_os = "linux")]
 pub const WIDTH: &str = "K1cam-Width";
 #[cfg(target_os = "linux")]

@@ -474,14 +474,15 @@ impl Remote {
 
     /// A snapshot: a JPEG as the camera sent it. `auto` keeps the host's capture
     /// running between requests; `after` asks for a frame newer than that one.
-    pub fn snapshot(&self, (w, h): (u32, u32), auto: bool, after: u64) -> R<Snap> {
-        let route = format!("snapshot.jpg?width={w}&height={h}&auto={}&after={after}", auto as u8);
+    pub fn snapshot(&self, (w, h): (u32, u32), auto: bool, after: u64, diagnostic: bool) -> R<Snap> {
+        let route = format!("snapshot.jpg?width={w}&height={h}&auto={}&after={after}&diagnostic={}", auto as u8, diagnostic as u8);
         let r = self.call("GET", &route, b"", Duration::from_secs(15))?;
         if !r.ok() {
             return Err(r.message());
         }
         let num = |k| r.get(k).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-        Ok(Snap { seq: num(api::SEQ), age: Duration::from_millis(num(api::AGE)), jpeg: r.body })
+        let diagnostic = diagnostic.then(|| r.get(api::DIAGNOSTIC).map(crate::diag::from_hex).transpose());
+        Ok(Snap { seq: num(api::SEQ), age: Duration::from_millis(num(api::AGE)), jpeg: r.body, diagnostic })
     }
 
     pub fn stop_snapshots(&self) {
@@ -495,6 +496,8 @@ impl Remote {
 }
 
 pub struct Snap {
+    /// None when not requested; otherwise a paired sample, unavailable, or a read error.
+    pub diagnostic: Option<R<Option<crate::diag::Snapshot>>>,
     pub jpeg: Vec<u8>,
     pub seq: u64,
     pub age: Duration,
@@ -831,10 +834,11 @@ mod tests {
         assert_eq!(t.sizes().unwrap()[0], (1920, 1080));
         assert_eq!(t.set(0, 999).unwrap(), 255);
         assert_eq!(t.get(&[0, 1]), [(0, 7), (1, 7)]);
-        let s = r.snapshot((640, 360), false, 0).unwrap();
+        let s = r.snapshot((640, 360), false, 0, true).unwrap();
         assert_eq!(&s.jpeg[..2], &[0xff, 0xd8]);
-        let a = r.snapshot((640, 360), true, 0).unwrap();
-        assert!(r.snapshot((640, 360), true, a.seq).unwrap().seq > a.seq);
+        assert_eq!(s.diagnostic.unwrap().unwrap().unwrap().exposure_us, 12345);
+        let a = r.snapshot((640, 360), true, 0, false).unwrap();
+        assert!(r.snapshot((640, 360), true, a.seq, false).unwrap().seq > a.seq);
         r.stop_snapshots();
         // The console, both ways.
         let mut p = RemotePort::open(r.clone()).unwrap();

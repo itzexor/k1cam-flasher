@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! Overlays for the Tuning tab's preview: where the camera meters exposure and
 //! how bright each of its zones is, clipped highlights and crushed shadows, a
-//! histogram and a framing grid. They come from the picture and the controls
-//! alone. The metering geometry follows uvcd (compute_view, zone_in_view and
-//! metering_weights in uvcd_camera.c); what subject metering picks is
-//! estimated from the picture, and the tuning file's own weights aren't known
-//! here.
+//! histogram and a framing grid. Fresh ISP diagnostics supply metering and
+//! histogram data; older firmware falls back to picture estimates. The
+//! fallback geometry follows uvcd's view and metering helpers; Subject
+//! weights are estimated and tuning-file weights remain unknown there.
 
 use eframe::egui::{pos2, vec2, Color32, ColorImage, FontId, Galley, Painter, Pos2, Rect, Stroke, StrokeKind};
 use std::sync::Arc;
@@ -30,6 +29,16 @@ pub struct View {
 }
 
 impl View {
+    /// Normalize sensor pixels to the geometry used by the overlay helpers.
+    pub fn diagnostic(d: &crate::diag::Snapshot) -> Self {
+        Self {
+            x: i32::from(d.view[0]) * SENSOR.0 / i32::from(d.sensor[0]),
+            y: i32::from(d.view[1]) * SENSOR.1 / i32::from(d.sensor[1]),
+            w: (i32::from(d.view[2]) * SENSOR.0 / i32::from(d.sensor[0])).max(1),
+            h: (i32::from(d.view[3]) * SENSOR.1 / i32::from(d.sensor[1])).max(1),
+        }
+    }
+
     pub fn new(frame: [usize; 2], zoom: i32, pan: i32, tilt: i32) -> Self {
         let (sw, sh) = (SENSOR.0 as i64, SENSOR.1 as i64);
         let (ow, oh) = (frame[0].max(1) as i64, frame[1].max(1) as i64);
@@ -343,12 +352,14 @@ pub fn draw_grid(p: &Painter, frame: Rect) {
 
 /// The luma histogram in `area`, with the clipping ends tinted and the
 /// median and the brightest 1% marked.
-pub fn draw_histogram(p: &Painter, area: Rect, hist: &[u32; 256]) {
+pub fn draw_histogram(p: &Painter, area: Rect, hist: &[u32; 256], linear: bool) {
     p.rect_filled(area, 4.0, BACKDROP);
     let inner = area.shrink(4.0);
     let at = |y: f32| inner.left() + y / 255.0 * inner.width();
-    p.rect_filled(Rect::from_x_y_ranges(at(0.0)..=at(6.0), inner.y_range()), 0.0, CRUSHED.gamma_multiply(0.5));
-    p.rect_filled(Rect::from_x_y_ranges(at(250.0)..=at(255.0), inner.y_range()), 0.0, STRIPE.gamma_multiply(0.5));
+    if !linear {
+        p.rect_filled(Rect::from_x_y_ranges(at(0.0)..=at(6.0), inner.y_range()), 0.0, CRUSHED.gamma_multiply(0.5));
+        p.rect_filled(Rect::from_x_y_ranges(at(250.0)..=at(255.0), inner.y_range()), 0.0, STRIPE.gamma_multiply(0.5));
+    }
     // A column per point of width, of the tallest bin under it.
     let width = inner.width().max(1.0) as usize;
     let column = |i: usize| {
@@ -489,5 +500,20 @@ mod tests {
         let got: Vec<u8> = s[0][..9].iter().map(|z| z.unwrap()).collect();
         assert_eq!(got, [0, 0, 1, 1, 2, 2, 3, 4, 4]);
         assert!(s[1][0].is_none());
+    }
+}
+
+/// ISP zones remain in ISP units; no guessed gamma conversion.
+pub fn diagnostic_zones(d: &crate::diag::Snapshot, view: &View) -> Grid<Option<f32>> {
+    std::array::from_fn(|r| std::array::from_fn(|c| view.holds(r, c).then_some(f32::from(d.zones[r][c]))))
+}
+
+pub fn draw_guard(p: &Painter, area: Rect, d: &crate::diag::Snapshot) {
+    let inner = area.shrink(4.0);
+    let mut marks = vec![(200.0, Color32::RED)];
+    if d.has(256) { marks.push((d.guard_level, Color32::GREEN)); }
+    for (bin, color) in marks {
+        let x = inner.left() + bin / 255.0 * inner.width();
+        p.line_segment([pos2(x, inner.top()), pos2(x, inner.bottom())], Stroke::new(1.5, color));
     }
 }

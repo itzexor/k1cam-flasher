@@ -733,13 +733,13 @@ impl Daemon {
         let _one = self.snapping.lock().unwrap();
         if req.flag("auto") {
             let shot = self.capture(size);
-            return self.next_shot(&shot, after);
+            return self.next_shot(&shot, after).map(|r| self.snapshot_diagnostic(req, r));
         }
         // A capture already running gives its next frame.
         let running = self.st().capture.as_ref().filter(|c| c.size == size).map(|c| c.shot.clone());
         if let Some(shot) = running {
             let seq = shot.0.lock().unwrap().seq;
-            return self.next_shot(&shot, seq);
+            return self.next_shot(&shot, seq).map(|r| self.snapshot_diagnostic(req, r));
         }
         self.stop_capture();
         // Otherwise the video starts for this one picture and stops again. The
@@ -756,8 +756,19 @@ impl Daemon {
             }
         };
         let got = f.size();
+        // Read before closing: the camera returns to its idle crop at STREAMOFF.
+        let reply = self.snapshot_diagnostic(req, jpeg_reply(&jpeg, self.next_seq(), Duration::ZERO, got));
         drop(f);
-        Ok(jpeg_reply(&jpeg, self.next_seq(), Duration::ZERO, got))
+        Ok(reply)
+    }
+
+    fn snapshot_diagnostic(&self, req: &Request, reply: Response) -> Response {
+        if !req.flag("diagnostic") { return reply; }
+        match self.tuner().and_then(|t| t.lock().unwrap().diagnostic().map_err(failed)) {
+            Ok(Some(record)) => reply.header(api::DIAGNOSTIC, xu::hex(&record)),
+            Ok(None) => reply,
+            Err(_) => reply.header(api::DIAGNOSTIC, "error"),
+        }
     }
 
     /// The automatic capture at `size`, started if it isn't running.
@@ -1263,6 +1274,7 @@ pub mod tests {
     #[derive(Default)]
     pub struct Fake {
         pub diagnostic: Arc<Mutex<Option<Vec<u8>>>>,
+        pub diagnostic_streams: Arc<Mutex<Vec<usize>>>,
         pub frames_open: Arc<AtomicUsize>,
         pub frames_opened: AtomicUsize,
         pub console_in: Arc<Mutex<Vec<u8>>>,
@@ -1303,10 +1315,17 @@ pub mod tests {
         }
     }
 
-    struct FakeTuner(Arc<Mutex<Option<Vec<u8>>>>);
+    struct FakeTuner {
+        diagnostic: Arc<Mutex<Option<Vec<u8>>>>,
+        streams: Arc<AtomicUsize>,
+        readings: Arc<Mutex<Vec<usize>>>,
+    }
 
     impl Tuner for FakeTuner {
-        fn diagnostic(&self) -> R<Option<Vec<u8>>> { Ok(self.0.lock().unwrap().clone()) }
+        fn diagnostic(&self) -> R<Option<Vec<u8>>> {
+            self.readings.lock().unwrap().push(self.streams.load(Ordering::SeqCst));
+            Ok(self.diagnostic.lock().unwrap().clone())
+        }
         fn sizes(&self) -> R<Vec<(u32, u32)>> {
             Ok(vec![(1920, 1080), (1280, 720)])
         }
@@ -1368,7 +1387,8 @@ pub mod tests {
             Ok("build=k1cam-test\nrunning_slot=b\n".into())
         }
         fn tuner(&self) -> R<Box<dyn Tuner>> {
-            Ok(Box::new(FakeTuner(self.diagnostic.clone())))
+            Ok(Box::new(FakeTuner { diagnostic: self.diagnostic.clone(), streams: self.frames_open.clone(),
+                readings: self.diagnostic_streams.clone() }))
         }
         fn frames(&self, w: u32, h: u32, _: u32) -> R<Box<dyn Frames>> {
             self.frames_open.fetch_add(1, Ordering::SeqCst);
@@ -1606,6 +1626,23 @@ pub mod tests {
         // The first frame after the start is passed over.
         assert_eq!(r.body[2], 2);
         assert_eq!(fake.frames_open.load(Ordering::SeqCst), 0, "a manual snapshot stops the video again");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn snapshot_diagnostics_are_read_before_the_stream_closes_and_only_when_asked() {
+        let dir = scratch("snapshot-diagnostic");
+        let fake = Arc::new(Fake::default());
+        *fake.diagnostic.lock().unwrap() = Some(crate::diag::tests::record());
+        let d = daemon(&dir, fake.clone());
+        let id = connect(&d);
+        let plain = d.handle(&req("GET", "/api/v1/snapshot.jpg", Some(&id), b""), "x");
+        assert!(plain.get(api::DIAGNOSTIC).is_none());
+        assert!(fake.diagnostic_streams.lock().unwrap().is_empty());
+        let paired = d.handle(&req("GET", "/api/v1/snapshot.jpg?diagnostic=1", Some(&id), b""), "x");
+        assert_eq!(paired.get(api::DIAGNOSTIC), Some(xu::hex(&crate::diag::tests::record()).as_str()));
+        assert_eq!(*fake.diagnostic_streams.lock().unwrap(), vec![1]);
+        assert_eq!(fake.frames_open.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 
