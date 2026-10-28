@@ -543,6 +543,13 @@ impl Daemon {
                 let info = self.dev.info().map_err(failed)?;
                 Ok(Response::new(200, "text/plain; charset=utf-8", info.into_bytes()))
             }
+            ("GET", "tuning/diagnostic") => {
+                let record = self.tuner()?.lock().unwrap().diagnostic().map_err(failed)?;
+                Ok(match record {
+                    Some(r) => Response::new(200, "application/octet-stream", r),
+                    None => Response::new(204, "application/octet-stream", Vec::new()),
+                })
+            }
             ("GET", "tuning/sizes") => Ok(Response::json(200, &self.tuner()?.lock().unwrap().sizes().map_err(failed)?)),
             ("GET", "tuning/controls") => Ok(Response::json(200, &self.tuner()?.lock().unwrap().load().map_err(failed)?)),
             ("GET", "tuning/get") => {
@@ -1255,6 +1262,7 @@ pub mod tests {
     /// Pretend devices: counts what is opened, and blocks jobs until told.
     #[derive(Default)]
     pub struct Fake {
+        pub diagnostic: Arc<Mutex<Option<Vec<u8>>>>,
         pub frames_open: Arc<AtomicUsize>,
         pub frames_opened: AtomicUsize,
         pub console_in: Arc<Mutex<Vec<u8>>>,
@@ -1295,9 +1303,10 @@ pub mod tests {
         }
     }
 
-    struct FakeTuner;
+    struct FakeTuner(Arc<Mutex<Option<Vec<u8>>>>);
 
     impl Tuner for FakeTuner {
+        fn diagnostic(&self) -> R<Option<Vec<u8>>> { Ok(self.0.lock().unwrap().clone()) }
         fn sizes(&self) -> R<Vec<(u32, u32)>> {
             Ok(vec![(1920, 1080), (1280, 720)])
         }
@@ -1359,7 +1368,7 @@ pub mod tests {
             Ok("build=k1cam-test\nrunning_slot=b\n".into())
         }
         fn tuner(&self) -> R<Box<dyn Tuner>> {
-            Ok(Box::new(FakeTuner))
+            Ok(Box::new(FakeTuner(self.diagnostic.clone())))
         }
         fn frames(&self, w: u32, h: u32, _: u32) -> R<Box<dyn Frames>> {
             self.frames_open.fetch_add(1, Ordering::SeqCst);
@@ -1560,6 +1569,25 @@ pub mod tests {
         d.tick();
         assert!(d.st().lock.is_none(), "an expired session lets go of the lock");
         assert!(session(&d, "laptop", "10.0.0.3").ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn diagnostics_need_a_session_without_capturing_video() {
+        let dir = scratch("diagnostic");
+        let fake = Arc::new(Fake::default());
+        let d = daemon(&dir, fake.clone());
+        let route = "/api/v1/tuning/diagnostic";
+        assert_eq!(d.handle(&req("GET", route, None, b""), "x").status, 403);
+        let id = connect(&d);
+        assert_eq!(d.handle(&req("GET", route, Some(&id), b""), "x").status, 204);
+        *fake.diagnostic.lock().unwrap() = Some(crate::diag::tests::record());
+        let response = d.handle(&req("GET", route, Some(&id), b""), "x");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, crate::diag::tests::record());
+        assert_eq!(fake.frames_opened.load(Ordering::SeqCst), 0);
+        d.end_session();
+        assert_eq!(d.handle(&req("GET", route, Some(&id), b""), "x").status, 403);
         let _ = std::fs::remove_dir_all(dir);
     }
 

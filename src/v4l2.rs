@@ -328,6 +328,10 @@ pub fn unsupported(e: &io::Error) -> bool {
 }
 
 impl Controls {
+    pub fn diagnostic(&self) -> Result<Option<Vec<u8>>, String> {
+        crate::diag::read(|s, q, data| crate::xu::xu_query(&self.f, s, q, data))
+    }
+
     pub fn open(node: &Path) -> R<Self> {
         Ok(Self { f: open(node)? })
     }

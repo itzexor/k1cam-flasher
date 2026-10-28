@@ -504,6 +504,15 @@ pub struct Snap {
 pub struct RemoteTuner(pub Arc<Remote>);
 
 impl Tuner for RemoteTuner {
+    fn diagnostic(&self) -> R<Option<Vec<u8>>> {
+        let r = self.0.call("GET", "tuning/diagnostic", b"", QUICK)?;
+        match r.status {
+            204 | 404 => Ok(None), // Older firmware or daemon.
+            200 => { crate::diag::Snapshot::parse(&r.body)?; Ok(Some(r.body)) },
+            _ => Err(r.message()),
+        }
+    }
+
     fn sizes(&self) -> R<Vec<(u32, u32)>> {
         self.0.json("GET", "tuning/sizes", b"", QUICK)
     }
@@ -640,8 +649,12 @@ mod tests {
     use std::sync::mpsc::channel;
 
     fn host(name: &str) -> (String, Arc<Daemon>, std::path::PathBuf) {
+        host_with_fake(name, Arc::new(Fake::default()))
+    }
+
+    fn host_with_fake(name: &str, fake: Arc<Fake>) -> (String, Arc<Daemon>, std::path::PathBuf) {
         let dir = scratch(name);
-        let d = daemon(&dir, Arc::new(Fake::default()));
+        let d = daemon(&dir, fake);
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap().to_string();
         let d2 = d.clone();
@@ -780,7 +793,8 @@ mod tests {
 
     #[test]
     fn every_operation_through_the_daemon() {
-        let (addr, _d, dir) = host("remote-ops");
+        let fake = Arc::new(Fake::default());
+        let (addr, _d, dir) = host_with_fake("remote-ops", fake.clone());
         let r = Remote::connect(&addr, PASSWORD).unwrap();
         assert!(r.status().camera);
         assert_eq!(r.info().unwrap(), "build=k1cam-test\nrunning_slot=b\n");
@@ -811,6 +825,9 @@ mod tests {
         assert!(rx.try_iter().any(|e| matches!(e, crate::job::Event::Log(l) if l == "working")));
         // Tuning and snapshots.
         let t = RemoteTuner(r.clone());
+        assert!(t.diagnostic().unwrap().is_none());
+        *fake.diagnostic.lock().unwrap() = Some(crate::diag::tests::record());
+        assert_eq!(t.diagnostic().unwrap().unwrap(), crate::diag::tests::record());
         assert_eq!(t.sizes().unwrap()[0], (1920, 1080));
         assert_eq!(t.set(0, 999).unwrap(), 255);
         assert_eq!(t.get(&[0, 1]), [(0, 7), (1, 7)]);

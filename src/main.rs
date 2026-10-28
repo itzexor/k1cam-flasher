@@ -7,6 +7,7 @@ mod cloner;
 #[cfg(feature = "gui")]
 mod console;
 mod controls;
+mod diag;
 #[cfg(target_os = "linux")]
 mod daemon;
 #[cfg(feature = "gui")]

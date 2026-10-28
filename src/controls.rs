@@ -173,6 +173,8 @@ pub const DEFS: &[Def] = &[
 /// The camera's image controls, wherever they are reached. Each call may wait
 /// on the camera (or the network), so callers keep them off the GUI thread.
 pub trait Tuner: Send {
+    /// The wire record, or None for firmware without diagnostics.
+    fn diagnostic(&self) -> Result<Option<Vec<u8>>, String> { Ok(None) }
     /// The MJPEG frame sizes the camera offers, largest first.
     fn sizes(&self) -> Result<Vec<(u32, u32)>, String>;
     /// Every control's state, in DEFS order; None where the camera lacks one.
@@ -207,6 +209,7 @@ mod local {
     }
 
     impl Tuner for Local {
+        fn diagnostic(&self) -> Result<Option<Vec<u8>>, String> { self.ctl.diagnostic() }
         fn sizes(&self) -> Result<Vec<(u32, u32)>, String> {
             v4l2::frame_sizes(&self.node)
         }
