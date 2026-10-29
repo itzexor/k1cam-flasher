@@ -390,7 +390,7 @@ impl App {
         let own = Own::new(!cfg!(test));
         let saved = if cfg!(test) { None } else { remote::saved::load() };
         Self {
-            tab: Tab::Cloner,
+            tab: Tab::Update,
             tab_chosen: false,
             log: Vec::new(),
             job: None,
@@ -1824,8 +1824,8 @@ impl eframe::App for App {
                 self.info_rx = None;
             }
             if !self.tab_chosen {
-                if self.camera_up {
-                    self.tab = Tab::Update;
+                if self.cloner_up && !self.camera_up {
+                    self.tab = Tab::Cloner;
                 }
                 self.tab_chosen = true;
             }
@@ -1880,6 +1880,8 @@ impl eframe::App for App {
                         "The whole 8 MiB flash, with Ingenic's cloner, through the boot ROM's USB boot mode: for installing k1cam once, \
                          and for a camera that no longer boots.",
                     );
+                    // USB boot mode on the left, a camera running k1cam on the right.
+                    ui.separator();
                     item(
                         ui,
                         Tab::Update,
