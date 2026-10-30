@@ -443,22 +443,54 @@ impl Console {
             crate::gui::weak_color(ui)
         };
         crate::gui::status(ui, color, self.note.as_str());
-        let row = ui.text_style_height(&egui::TextStyle::Monospace);
-        let input = ui.spacing().interact_size.y + ui.spacing().item_spacing.y * 2.0;
-        egui::ScrollArea::both()
-            .stick_to_bottom(true)
-            .auto_shrink([false, false])
-            .max_height((ui.available_height() - input).max(row))
-            .show_rows(ui, row, self.term.rows(), |ui, rows| {
-                for i in rows {
-                    ui.add(egui::Label::new(egui::RichText::new(self.term.row(i)).monospace()).wrap_mode(egui::TextWrapMode::Extend));
-                }
-            });
-        let edit = egui::TextEdit::singleline(&mut self.input)
-            .font(egui::TextStyle::Monospace)
-            .desired_width(f32::INFINITY)
-            .hint_text("Enter sends the line; an empty one wakes the console's prompt");
-        let r = ui.add_enabled(connected, edit);
+        // Output and input share one terminal-like pane, the input line at its foot.
+        let line = ui.visuals().widgets.noninteractive.bg_stroke;
+        let pane = egui::Frame::new().fill(ui.visuals().extreme_bg_color).stroke(line).corner_radius(4);
+        let r = pane
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let row = ui.text_style_height(&egui::TextStyle::Monospace);
+                let pad = 10.0;
+                let input = row + 2.0 * pad;
+                // Its own id: the Backup and A/B tabs scroll in the same place,
+                // and sharing their offset sent the console back to the top.
+                egui::ScrollArea::both()
+                    .id_salt("console")
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .content_margin(egui::Margin::symmetric(pad as i8, 6))
+                    .max_height((ui.available_height() - input - line.width).max(row))
+                    .show_rows(ui, row, self.term.rows(), |ui, rows| {
+                        for i in rows {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(self.term.row(i)).monospace()).wrap_mode(egui::TextWrapMode::Extend),
+                            );
+                        }
+                    });
+                let top = ui.cursor().top();
+                ui.painter().hline(ui.max_rect().x_range(), top, line);
+                ui.add_space(line.width);
+                let size = egui::vec2(ui.available_width(), input);
+                ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let color = if connected { ui.visuals().strong_text_color() } else { crate::gui::weak_color(ui) };
+                    ui.add_space(pad);
+                    ui.label(egui::RichText::new(">").monospace().color(color));
+                    let edit = egui::TextEdit::singleline(&mut self.input)
+                        .id_salt("console-input")
+                        .font(egui::TextStyle::Monospace)
+                        .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(8, pad as i8)))
+                        .desired_width(f32::INFINITY)
+                        .hint_text(if connected {
+                            "Enter sends the line; an empty one wakes the console's prompt"
+                        } else {
+                            "Connect to type here"
+                        });
+                    ui.add_enabled(connected, edit)
+                })
+                .inner
+            })
+            .inner;
         if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             let line = std::mem::take(&mut self.input);
             self.send(format!("{line}\r").as_bytes());
