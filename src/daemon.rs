@@ -1672,11 +1672,15 @@ pub mod tests {
     }
 
     fn wait_done(d: &Arc<Daemon>, sid: &str, id: &str) -> api::Job {
+        // Polling from the last line seen, so each poll waits for news.
+        let mut after = 0;
         for _ in 0..100 {
-            let j: api::Job = d.handle(&req("GET", &format!("/api/v1/jobs/{id}?wait=100"), Some(sid), b""), "x").parse().unwrap();
+            let j: api::Job =
+                d.handle(&req("GET", &format!("/api/v1/jobs/{id}?after={after}&wait=100"), Some(sid), b""), "x").parse().unwrap();
             if j.done.is_some() {
                 return j;
             }
+            after = j.next;
         }
         panic!("job {id} did not finish");
     }
