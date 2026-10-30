@@ -486,7 +486,9 @@ impl Console {
                         } else {
                             "Connect to type here"
                         });
-                    ui.add_enabled(connected, edit)
+                    let r = ui.add_enabled(connected, edit);
+                    crate::context_menu::field(ui, &r, &self.input);
+                    r
                 })
                 .inner
             })

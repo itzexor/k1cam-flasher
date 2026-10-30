@@ -6,6 +6,8 @@ mod cli;
 mod cloner;
 #[cfg(feature = "gui")]
 mod console;
+#[cfg(feature = "gui")]
+mod context_menu;
 mod controls;
 mod diag;
 #[cfg(target_os = "linux")]

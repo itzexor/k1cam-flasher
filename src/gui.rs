@@ -1556,11 +1556,13 @@ impl App {
             ui.label("Host");
             let hint = "name or address";
             let r = ui.add_enabled(!busy, egui::TextEdit::singleline(&mut self.conn.host).hint_text(hint).desired_width(300.0));
+            crate::context_menu::field(ui, &r, &self.conn.host);
             go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.end_row();
             ui.label("Code");
             let edit = egui::TextEdit::singleline(&mut self.conn.password).hint_text("as the daemon printed it");
             let r = ui.add_enabled(!busy, edit.desired_width(300.0));
+            crate::context_menu::field(ui, &r, &self.conn.password);
             go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.end_row();
         });
@@ -1613,6 +1615,7 @@ impl App {
                     ui.label("Code");
                     let edit = egui::TextEdit::singleline(&mut self.conn.password).hint_text("from its terminal");
                     let field = ui.add_enabled(!trying, edit.desired_width(140.0));
+                    crate::context_menu::field(ui, &field, &self.conn.password);
                     if std::mem::take(&mut self.conn.focus_code) {
                         field.request_focus();
                     }
@@ -2154,6 +2157,7 @@ impl eframe::App for App {
                 Tab::Help => self.help_tab(ui),
             }
         });
+        crate::context_menu::show(&ctx);
         // Dragging files over the window says what dropping them does.
         if !self.busy() && ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("drop")));
@@ -2272,6 +2276,7 @@ pub fn run(args: &[String]) -> eframe::Result {
         opts,
         Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            cc.egui_ctx.add_plugin(crate::context_menu::ContextMenu::default());
             let mut app = App::new();
             let mut it = args.iter();
             while let Some(arg) = it.next() {
