@@ -24,6 +24,15 @@ enum Tab {
     Help,
 }
 
+/// The pages of the Help tab.
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+enum HelpPage {
+    Overview,
+    UsbBoot,
+    Permissions,
+    Remote,
+}
+
 /// What a job does, so that its outcome shows where it was started.
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 enum Op {
@@ -116,6 +125,8 @@ struct App {
     tab: Tab,
     /// The tab shown until now, to notice it being left.
     shown_tab: Tab,
+    /// The page Help opens on.
+    help_page: HelpPage,
     /// Until a tab is chosen, the first look at what is attached picks one.
     tab_chosen: bool,
     log: Vec<Line>,
@@ -400,6 +411,7 @@ impl App {
         Self {
             tab: Tab::Update,
             shown_tab: Tab::Update,
+            help_page: HelpPage::Overview,
             tab_chosen: false,
             log: Vec::new(),
             job: None,
@@ -850,9 +862,6 @@ impl App {
                 if !self.cloner_up && !self.busy() {
                     line(ui, weak_color(ui), "Waiting for a camera in USB boot mode.")
                         .on_hover_text("The camera answers here when it powers up with two pins of its flash chip shorted.");
-                    if ui.link("How to connect the camera for flashing").clicked() {
-                        self.tab = Tab::Help;
-                    }
                 } else {
                     self.result_line(ui, &[Op::Detect], "Not detected yet");
                 }
@@ -915,14 +924,6 @@ impl App {
     /// Every line on this tab is always there: a bundle fills in its column of
     /// the table, and the long lists open over the page.
     fn update_tab(&mut self, ui: &mut egui::Ui) {
-        if self.ab_unavailable() {
-            status(
-                ui,
-                warn_color(ui),
-                "Not available on Windows itself; use the camera through a Linux computer (the connection menu, top right), or the cloner on the Backup & Flash tab.",
-            );
-            ui.add_space(8.0);
-        }
         // Not while the info record is being read: one exchange at a time.
         let idle = !self.busy() && self.info_rx.is_none() && self.camera_up && !self.ab_unavailable();
         card(ui, "Firmware", |ui| self.firmware_card(ui, idle));
@@ -1104,9 +1105,121 @@ impl App {
         });
     }
 
+    /// Help: pages listed down the side, each scrolling on its own.
     fn help_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Getting the camera into USB boot mode");
-        ui.label("The camera only boots from USB, where the cloner can reach it, when its SoC cannot boot from the flash. Shorting two of the flash chip's pins while it powers up does that.");
+        let pages = [
+            (HelpPage::Overview, "Overview"),
+            (HelpPage::UsbBoot, "USB boot mode"),
+            (HelpPage::Permissions, "Drivers & permissions"),
+            (HelpPage::Remote, "Another computer"),
+        ];
+        egui::Panel::left("help-pages").resizable(false).exact_size(190.0).show(ui, |ui| {
+            ui.add_space(4.0);
+            for (page, label) in pages {
+                let b = egui::Button::selectable(self.help_page == page, label).min_size(egui::vec2(ui.available_width(), 26.0));
+                if ui.add(b).clicked() {
+                    self.help_page = page;
+                }
+            }
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                ui.add_space(4.0);
+                ui.hyperlink_to("Source on GitHub", "https://github.com/itzexor/k1cam-flasher");
+                ui.label(RichText::new(format!("Version {} · GPL-2.0-only", env!("CARGO_PKG_VERSION"))).color(weak_color(ui)));
+            });
+        });
+        // Its own id: the other tabs scroll in the same place.
+        let scroll = egui::ScrollArea::vertical().id_salt(("help", self.help_page)).auto_shrink([false, false]);
+        scroll.content_margin(egui::Margin::symmetric(16, 0)).show(ui, |ui| {
+            // Lines stay short enough to read on a wide window.
+            ui.set_max_width(960.0);
+            ui.add_space(4.0);
+            match self.help_page {
+                HelpPage::Overview => self.help_overview(ui),
+                HelpPage::UsbBoot => self.help_usb_boot(ui),
+                HelpPage::Permissions => self.help_permissions(ui),
+                HelpPage::Remote => help_remote(ui),
+            }
+        });
+    }
+
+    fn help_overview(&mut self, ui: &mut egui::Ui) {
+        page_heading(ui, "Overview");
+        section(ui, "This computer or another one");
+        para(
+            ui,
+            "The connection menu at the top right chooses where the camera is plugged in: into this computer, or into a Linux computer \
+             running k1cam-flasher daemon, which this window then uses over the network.",
+        );
+        section(ui, "Installing firmware");
+        let cloner = (
+            "Backup & Flash",
+            "The first install, a camera that won't boot, or restoring the stock firmware",
+            [
+                "Needs USB boot mode: two pins of the flash chip shorted as the camera powers up.",
+                "Reads or writes the whole 8 MiB flash, U-Boot included. Take a backup before the first flash.",
+            ],
+        );
+        let ab = (
+            "A/B Update",
+            "A camera already running k1cam",
+            [
+                "Over the camera's usual USB connection, nothing to open.",
+                "Installs into the slot not running and boots it as a trial; the camera goes back to the old slot if the trial fails.",
+            ],
+        );
+        let card = |ui: &mut egui::Ui, width: f32, (title, use_for, points): (&str, &str, [&str; 2])| {
+            egui::Frame::group(ui.style()).inner_margin(10).show(ui, |ui| {
+                ui.set_width(width);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(title).strong());
+                    ui.label(RichText::new(use_for).color(weak_color(ui)));
+                    ui.add_space(4.0);
+                    points.iter().for_each(|p| bullet(ui, p));
+                });
+            });
+        };
+        // Side by side where there is room for both.
+        let width = ui.available_width();
+        if width >= 640.0 {
+            let w = (width - 12.0) / 2.0 - 22.0;
+            ui.horizontal_top(|ui| {
+                card(ui, w, cloner);
+                card(ui, w, ab);
+            });
+        } else {
+            card(ui, width - 22.0, cloner);
+            ui.add_space(4.0);
+            card(ui, width - 22.0, ab);
+        }
+        section(ui, "What works where");
+        let remote = "through another computer";
+        egui::Grid::new("help-where").striped(true).spacing([24.0, 6.0]).show(ui, |ui| {
+            for h in ["", "Linux", "Windows (untested)", "macOS (untested)"] {
+                ui.label(RichText::new(h).strong());
+            }
+            ui.end_row();
+            for row in [
+                ["Backup & Flash", "yes", "yes, with the WinUSB driver", "yes"],
+                ["A/B Update", "yes", remote, "yes"],
+                ["Tuning", "live video", "snapshots, through another computer", "snapshots, through another computer"],
+                ["Console", "yes", "yes", "yes"],
+            ] {
+                for cell in row {
+                    ui.label(cell);
+                }
+                ui.end_row();
+            }
+        });
+        ui.add_space(8.0);
+    }
+
+    fn help_usb_boot(&mut self, ui: &mut egui::Ui) {
+        page_heading(ui, "USB boot mode");
+        para(
+            ui,
+            "Backup & Flash reaches the camera through its boot ROM, which only listens on USB when the chip cannot boot from its flash. \
+             Shorting two of the flash chip's pins while the camera powers up does that.",
+        );
         ui.add_space(8.0);
         let steps = [
             "Unplug the camera's USB cable and any power.",
@@ -1125,9 +1238,12 @@ impl App {
                 ui.add_space(2.0);
             }
             ui.add_space(4.0);
-            ui.label(
+            para(
+                ui,
                 "If it does not show up, power-cycle and try again: the short only matters at power-up. Don't hold it during the transfer.",
             );
+            ui.add_space(4.0);
+            para(ui, "On Windows, the camera in this mode needs the WinUSB driver (see Drivers & permissions) before it shows up here.");
         };
         // Side by side where there is room for both.
         let width = ui.available_width();
@@ -1142,60 +1258,34 @@ impl App {
             ui.add_space(6.0);
             text(ui);
         }
-        ui.add_space(14.0);
-        ui.heading("Drivers and permissions");
-        ui.add_space(4.0);
-        ui.label(RichText::new("Linux").strong());
-        ui.label("Install the udev rule from the repository (udev/99-k1cam-flasher.rules):");
-        let cmd = "sudo cp udev/99-k1cam-flasher.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger";
-        ui.horizontal_top(|ui| {
-            if ui.small_button("Copy").clicked() {
-                ui.ctx().copy_text(cmd.into());
-            }
-            ui.add(egui::Label::new(RichText::new(cmd).monospace()).wrap());
-        });
-        ui.label("A/B Update and Tuning need the camera's /dev/video node (the video group); the console needs /dev/ttyACM* (dialout, or uucp on Arch).");
-        ui.add_space(6.0);
-        ui.label(RichText::new("Windows").strong());
-        ui.label("Bind WinUSB to a108:c309 with Zadig while the camera is in USB boot mode.");
-        ui.add_space(6.0);
-        ui.label(RichText::new("macOS").strong());
-        ui.label("Nothing to install.");
-        ui.add_space(14.0);
-        ui.heading("A camera on another computer");
-        ui.add_space(4.0);
-        ui.label(
-            "The camera can be plugged into another computer running Linux, a Raspberry Pi or a router for example, and used from here over the network. \
-             On that computer, run the daemon (the static command-line builds have it), as a user who can open the camera:",
+    }
+
+    fn help_permissions(&mut self, ui: &mut egui::Ui) {
+        page_heading(ui, "Drivers & permissions");
+        para(ui, "Running k1cam-flasher as root (Linux) or administrator needs none of the permission changes below; Windows still needs its driver.");
+        section(ui, "Linux");
+        para(
+            ui,
+            "Install the udev rule from the repository (udev/99-k1cam-flasher.rules). It opens the camera's USB device to you, in USB boot mode \
+             and running k1cam, and keeps ModemManager from typing into its console:",
         );
-        let daemon = "k1cam-flasher daemon";
-        ui.horizontal_top(|ui| {
-            if ui.small_button("Copy").clicked() {
-                ui.ctx().copy_text(daemon.into());
-            }
-            ui.add(egui::Label::new(RichText::new(daemon).monospace()).wrap());
-        });
-        ui.label(
-            "It takes no options, and prints the addresses to connect to and a code (a new one each time it starts, and after 5 wrong attempts). \
-             In the connection menu at the top right, choose Another computer, and enter one of the addresses and the code.",
+        copyable(ui, "sudo cp udev/99-k1cam-flasher.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger");
+        para(
+            ui,
+            "A/B Update and Tuning also need the camera's /dev/video node (the video group), and the console /dev/ttyACM* \
+             (the dialout group, uucp on Arch). Log out and back in after joining a group.",
         );
-        ui.label(
-            "Every tab then works on that camera, from any system, Windows included. Files stay here: an image or bundle goes there when \
-             the job starts, and a backup comes back when it ends (the other computer keeps it until it is saved here). A job carries on \
-             there if the connection drops. Tuning shows snapshots instead of live video, and one window controls the camera at a time.",
+        section(ui, "Windows");
+        para(
+            ui,
+            "Backup & Flash needs the WinUSB driver bound to the camera in USB boot mode (a108:c309): put it in USB boot mode, then choose it in \
+             Zadig and install WinUSB. That is once per computer. Running as administrator doesn't replace it. The console needs nothing.",
         );
-        ui.label(
-            RichText::new(format!(
-                "The connection is plain HTTP on port {}, the code included: use it on a network you trust.",
-                api::PORT
-            ))
-            .color(weak_color(ui)),
-        );
-        ui.add_space(14.0);
-        ui.heading("About");
-        ui.add_space(4.0);
-        ui.label(format!("k1cam-flasher {}, GPL-2.0-only.", env!("CARGO_PKG_VERSION")));
-        ui.hyperlink_to("github.com/itzexor/k1cam-flasher", "https://github.com/itzexor/k1cam-flasher");
+        ui.hyperlink_to("zadig.akeo.ie", "https://zadig.akeo.ie/");
+        section(ui, "macOS");
+        para(ui, "Nothing to install.");
+        section(ui, "Another computer");
+        para(ui, "The daemon needs the same access on the computer it runs on: the udev rule and groups above, or root.");
     }
 
     /// The log beside the tabs that run jobs: each operation under a heading
@@ -1293,6 +1383,7 @@ impl App {
         Some(match self.tab {
             Tab::Cloner if self.cloner_up => (true, "Camera in USB boot mode", "USB a108:c309".to_string()),
             Tab::Cloner => (false, "No camera in USB boot mode", String::new()),
+            Tab::Update if self.ab_unavailable() => (false, "Local A/B flashing unavailable on Windows", String::new()),
             Tab::Update | Tab::Tuning if self.camera_up => {
                 let slot = match &self.cam_info {
                     Some(Ok(i)) => xu::record_value(i, "running_slot").map(|s| format!("connected · slot {}", s.to_uppercase())),
@@ -1313,6 +1404,15 @@ impl App {
         })
     }
 
+    /// The help page for the open tab's status, while it is one that needs it.
+    fn status_help(&self) -> Option<HelpPage> {
+        match self.tab {
+            Tab::Cloner if !self.cloner_up && !self.busy() => Some(HelpPage::UsbBoot),
+            Tab::Update if self.ab_unavailable() => Some(HelpPage::Remote),
+            _ => None,
+        }
+    }
+
     /// The tint behind the status bar: blue while a job runs, green while the
     /// open tab's device is there, grey otherwise.
     fn status_fill(&self, ui: &egui::Ui) -> Color32 {
@@ -1327,7 +1427,8 @@ impl App {
     /// The open tab's device on the left; the running job on the right.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let (weak, strong) = (weak_color(ui), ui.visuals().strong_text_color());
-        let device = self.device_status();
+        let (device, help) = (self.device_status(), self.status_help());
+        let mut go = None;
         egui::Sides::new().height(26.0).shrink_right().show(
             ui,
             |ui| {
@@ -1335,6 +1436,9 @@ impl App {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
                 ui.painter().circle_filled(rect.center(), 5.0, if up { ok_color(ui) } else { weak });
                 ui.label(RichText::new(text).size(16.0).color(strong));
+                if help.is_some() && help_mark(ui) {
+                    go = help;
+                }
                 ui.label(RichText::new(detail).color(weak));
             },
             |ui| {
@@ -1368,6 +1472,14 @@ impl App {
                 ui.add(egui::Label::new(text).truncate());
             },
         );
+        if let Some(page) = go {
+            self.open_help(page);
+        }
+    }
+
+    fn open_help(&mut self, page: HelpPage) {
+        self.tab = Tab::Help;
+        self.help_page = page;
     }
 
     /// The connection menu's button: where the camera is, and a dot for how
@@ -1404,41 +1516,35 @@ impl App {
     }
 
     fn connection_menu(&mut self, ui: &mut egui::Ui) {
-        let weak = weak_color(ui);
         let busy = self.busy() || self.conn.connecting.is_some() || self.conn.reconnecting.is_some();
         ui.label(RichText::new("Where the camera is plugged in").strong().size(15.0));
         ui.add_space(4.0);
-        // What a choice means, under its label.
-        let under = |ui: &mut egui::Ui, text: &str| {
-            ui.horizontal(|ui| {
-                ui.add_space(ui.spacing().icon_width + ui.spacing().icon_spacing);
-                ui.label(RichText::new(text).color(weak));
-            });
-        };
-        let r = ui.add_enabled_ui(!busy, |ui| {
-            if ui.radio(!self.conn.elsewhere, "This computer").clicked() {
-                self.conn.elsewhere = false;
-            }
-            under(ui, "USB devices attached here");
-            if !self.conn.elsewhere && self.remote.is_some() && ui.button("Disconnect and use this computer").clicked() {
-                self.use_remote(None);
-            }
-            if ui.radio(self.conn.elsewhere, "Another computer").clicked() {
+        let wait = "Wait for the operation to finish";
+        if ui.add_enabled(!busy, egui::RadioButton::new(!self.conn.elsewhere, "This computer")).on_disabled_hover_text(wait).clicked() {
+            self.conn.elsewhere = false;
+        }
+        if !self.conn.elsewhere
+            && self.remote.is_some()
+            && ui.add_enabled(!busy, egui::Button::new("Disconnect and use this computer")).clicked()
+        {
+            self.use_remote(None);
+        }
+        ui.horizontal(|ui| {
+            let r = ui.add_enabled(!busy, egui::RadioButton::new(self.conn.elsewhere, "Another computer"));
+            if r.on_disabled_hover_text(wait).clicked() {
                 self.conn.elsewhere = true;
             }
-            under(ui, "A Linux computer running k1cam-flasher daemon");
+            if help_mark(ui) {
+                self.open_help(HelpPage::Remote);
+                self.conn.close = true;
+            }
         });
-        r.response.on_disabled_hover_text("Wait for the operation to finish");
         if self.conn.elsewhere {
             ui.add_space(4.0);
             match self.remote.clone() {
                 Some(r) => self.connected_ui(ui, &r),
                 None => self.fields_ui(ui, busy),
             }
-            ui.add_space(6.0);
-            ui.separator();
-            ui.label(RichText::new("On the other computer, as a user who can open the camera:").color(weak));
-            ui.monospace("# k1cam-flasher daemon");
         }
     }
 
@@ -1768,6 +1874,67 @@ fn compare(ui: &mut egui::Ui, info: Option<&str>, b: Option<&bundle::Bundle>) {
     });
 }
 
+/// Help on running the daemon and connecting to it.
+fn help_remote(ui: &mut egui::Ui) {
+    page_heading(ui, "Another computer");
+    para(
+        ui,
+        "The camera can be plugged into another computer running Linux, a Raspberry Pi or a router for example, and used from here over \
+         the network. On Windows, that is how A/B Update and Tuning work. On that computer, as a user who can open the camera, run the \
+         daemon (the static command-line builds have it):",
+    );
+    copyable(ui, "k1cam-flasher daemon");
+    para(
+        ui,
+        "It prints the addresses to connect to and a code. In the connection menu at the top right, choose Another computer, and enter \
+         one of the addresses and the code.",
+    );
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(format!("The connection is plain HTTP on port {}, the code included: use it on a network you trust.", api::PORT))
+            .color(weak_color(ui)),
+    );
+}
+
+/// The title of a help page.
+fn page_heading(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).heading().strong());
+    ui.add_space(4.0);
+}
+
+/// A section of a help page, spaced from the one before.
+fn section(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(12.0);
+    ui.label(RichText::new(text).strong().size(16.0));
+    ui.add_space(2.0);
+}
+
+/// A wrapping paragraph of help.
+fn para(ui: &mut egui::Ui, text: &str) {
+    ui.add(egui::Label::new(text).wrap());
+    ui.add_space(4.0);
+}
+
+/// One point of a list, its text hanging past the bullet.
+fn bullet(ui: &mut egui::Ui, text: &str) {
+    ui.horizontal_top(|ui| {
+        ui.label("•");
+        ui.add(egui::Label::new(text).wrap());
+    });
+    ui.add_space(2.0);
+}
+
+/// A command to type, with a button that copies it.
+fn copyable(ui: &mut egui::Ui, cmd: &str) {
+    ui.horizontal_top(|ui| {
+        if ui.small_button("Copy").clicked() {
+            ui.ctx().copy_text(cmd.into());
+        }
+        ui.add(egui::Label::new(RichText::new(cmd).monospace()).wrap());
+    });
+    ui.add_space(4.0);
+}
+
 /// Help, made easy to find: a filled circle with a question mark, painted.
 fn help_button(ui: &mut egui::Ui, selected: bool) -> bool {
     let icon = egui::IdSalt::new("help-icon");
@@ -1782,11 +1949,25 @@ fn help_button(ui: &mut egui::Ui, selected: bool) -> bool {
         painter.rect_stroke(r.response.rect, 12.0, egui::Stroke::new(1.0, accent.gamma_multiply(0.6)), egui::StrokeKind::Inside);
     }
     if let Some(rect) = r.rect(icon) {
-        painter.circle_filled(rect.center(), 8.0, accent);
-        let font = egui::FontId::proportional(13.0);
-        painter.text(rect.center() + egui::vec2(0.0, 0.5), egui::Align2::CENTER_CENTER, "?", font, ui.visuals().panel_fill);
+        paint_help_mark(ui, rect.center(), accent);
     }
-    r.response.on_hover_text("Help: USB boot mode, drivers, about").clicked()
+    r.response.on_hover_text("Help: how it works, USB boot mode, drivers, another computer").clicked()
+}
+
+/// The help mark: a filled circle with a question mark, painted.
+fn paint_help_mark(ui: &egui::Ui, center: egui::Pos2, color: Color32) {
+    let painter = ui.painter();
+    painter.circle_filled(center, 8.0, color);
+    let font = egui::FontId::proportional(13.0);
+    painter.text(center + egui::vec2(0.0, 0.5), egui::Align2::CENTER_CENTER, "?", font, ui.visuals().panel_fill);
+}
+
+/// The help mark beside what it explains; clicked, its help page opens.
+fn help_mark(ui: &mut egui::Ui) -> bool {
+    let (rect, r) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+    let accent = ui.visuals().hyperlink_color;
+    paint_help_mark(ui, rect.center(), if r.hovered() { accent } else { accent.gamma_multiply(0.85) });
+    r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open help on this").clicked()
 }
 
 /// One line of the log, timed.
@@ -1970,9 +2151,7 @@ impl eframe::App for App {
                 }
                 Tab::Tuning => self.tuning.ui(ui, self.camera_up),
                 Tab::Console => self.console.ui(ui),
-                Tab::Help => {
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.help_tab(ui));
-                }
+                Tab::Help => self.help_tab(ui),
             }
         });
         // Dragging files over the window says what dropping them does.
