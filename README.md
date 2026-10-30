@@ -11,9 +11,11 @@ A small, single-binary GUI to back up, flash and update the Creality K1 camera (
 
 The status bar under the tabs shows whether the open tab's device is attached (green when it is) and follows a running operation (blue): its progress, what it last said, the time taken and left, and *Cancel*. Beside Backup & Flash and A/B Update, the log shows each operation under a heading with when it started, how long it took and how it ended; it opens by itself when one starts, and folded away to a strip it counts the operations finished since, in red if one failed. A tab's lines are all there from the start, so nothing moves as results come in. Dropping a `k1cam.upd` on the window opens it on the A/B tab, a `.bin` image on Backup & Flash. Closing the window while an operation runs asks first.
 
-| Backup & Flash | A/B Update | Tuning | Help |
-|---|---|---|---|
-| ![Backup & Flash tab](docs/screenshot-cloner.png) | ![A/B Update tab](docs/screenshot-update.png) | ![Tuning tab](docs/screenshot-tuning.png) | ![Help tab](docs/screenshot-help.png) |
+| A/B Update | Tuning | Console |
+|---|---|---|
+| ![A/B Update tab](docs/screenshot-update.png) | ![Tuning tab](docs/screenshot-tuning.png) | ![Console tab](docs/screenshot-console.png) |
+| **Backup & Flash** | **Help** | |
+| ![Backup & Flash tab](docs/screenshot-cloner.png) | ![Help tab](docs/screenshot-help.png) | |
 
 > Take and check a backup before relying on it.
 
