@@ -773,6 +773,13 @@ impl Tuning {
         self.mask = None;
     }
 
+    /// The tab was left: the camera is let go, as Disconnect does.
+    pub fn leave(&mut self) {
+        if self.connected {
+            self.disconnect();
+        }
+    }
+
     /// Transfer all active threads to the job so it can wait for their devices.
     pub fn stop(&mut self) -> Vec<JoinHandle<()>> {
         self.disconnect();
@@ -1552,6 +1559,17 @@ mod tests {
         assert!(!tuning.connected, "replugging must require another Connect");
         assert!(tuning.stream.is_none());
         assert!(tuning.worker.is_none());
+    }
+
+    #[test]
+    fn leaving_the_tab_disconnects_and_otherwise_changes_nothing() {
+        let mut tuning = Tuning::new(crate::gui::Own::default());
+        tuning.note = "the camera's video is in use by cheese".into();
+        tuning.leave();
+        assert_eq!(tuning.note, "the camera's video is in use by cheese", "not connected: nothing to let go");
+        tuning.connected = true;
+        tuning.leave();
+        assert!(!tuning.connected && !tuning.in_use());
     }
 
     #[test]

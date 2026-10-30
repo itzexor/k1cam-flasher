@@ -65,6 +65,12 @@ impl Op {
         }
     }
 
+    /// Installing, rebooting into a trial and cancelling it: the A/B update,
+    /// which keeps its tab open while it runs.
+    fn ab(self) -> bool {
+        matches!(self, Op::Update | Op::Reboot | Op::Cancel)
+    }
+
     /// What quitting halfway leaves behind.
     fn risk(self) -> &'static str {
         match self {
@@ -108,6 +114,8 @@ struct Line {
 
 struct App {
     tab: Tab,
+    /// The tab shown until now, to notice it being left.
+    shown_tab: Tab,
     /// Until a tab is chosen, the first look at what is attached picks one.
     tab_chosen: bool,
     log: Vec<Line>,
@@ -391,6 +399,7 @@ impl App {
         let saved = if cfg!(test) { None } else { remote::saved::load() };
         Self {
             tab: Tab::Update,
+            shown_tab: Tab::Update,
             tab_chosen: false,
             log: Vec::new(),
             job: None,
@@ -607,6 +616,27 @@ impl App {
         self.job.is_some()
     }
 
+    /// An A/B update runs: the other tabs wait (Help aside).
+    fn ab_running(&self) -> bool {
+        self.job.as_ref().is_some_and(|j| j.op.ab())
+    }
+
+    /// An A/B update keeps its tab open until it ends (one found running on
+    /// a host opens it), and leaving Tuning or Console lets the camera go.
+    fn interlock_tabs(&mut self) {
+        if self.ab_running() && !matches!(self.tab, Tab::Update | Tab::Help) {
+            self.tab = Tab::Update;
+        }
+        if self.tab != self.shown_tab {
+            match self.shown_tab {
+                Tab::Tuning => self.tuning.leave(),
+                Tab::Console => self.console.disconnect(),
+                _ => {}
+            }
+            self.shown_tab = self.tab;
+        }
+    }
+
     fn note(&mut self, level: Level, text: impl Into<String>) {
         // A new operation folds the ones before it.
         if level == Level::Start {
@@ -710,8 +740,8 @@ impl App {
             Err(e) => self.note(Level::Failed, e.clone()),
         }
         // Installing, rebooting into a trial and cancelling it share one line.
-        if matches!(op, Op::Update | Op::Reboot | Op::Cancel) {
-            self.results.retain(|o, _| !matches!(o, Op::Update | Op::Reboot | Op::Cancel));
+        if op.ab() {
+            self.results.retain(|o, _| !o.ab());
         }
         self.results.insert(op, r);
         self.job = None;
@@ -1808,6 +1838,7 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain();
         self.poll_remote();
+        self.interlock_tabs();
         if !self.busy() && self.last_poll.elapsed() > Duration::from_secs(1) {
             match &self.remote {
                 Some(r) => {
@@ -1860,16 +1891,18 @@ impl eframe::App for App {
         self.take_dropped(&ctx);
         self.guard_close(&ctx);
 
-        // The tabs stay open during a job: the status bar follows it from any of them.
+        // The tabs stay open during a job, but for the A/B update: the status
+        // bar follows it from any of them.
         egui::Panel::top("tabs").show(ui, |ui| {
             ui.add_space(6.0);
-            let tab = self.tab;
+            let (tab, locked) = (self.tab, self.ab_running());
             let (left, right) = egui::Sides::new().show(
                 ui,
                 |ui| {
                     let mut pick = None;
                     let mut item = |ui: &mut egui::Ui, t: Tab, label: &str, tip: &str| {
-                        if ui.add(egui::Button::selectable(tab == t, label)).on_hover_text(tip).clicked() {
+                        let b = ui.add_enabled(!locked || t == Tab::Update, egui::Button::selectable(tab == t, label));
+                        if b.on_hover_text(tip).on_disabled_hover_text("Open once the A/B update ends").clicked() {
                             pick = Some(t);
                         }
                     };
@@ -1989,6 +2022,25 @@ mod tests {
         app.cam_info = Some(Err("camera did not answer".into()));
         app.poll_camera_info(read);
         assert!(app.info_rx.is_none(), "failed comparisons wait for an explicit retry");
+    }
+
+    #[test]
+    fn an_ab_update_keeps_its_tab_and_other_jobs_do_not() {
+        let running = |op| Running { op, rx: channel().1, started: Instant::now(), progress: 0.0, step: Instant::now() };
+        let mut app = App::new();
+        for op in [Op::Update, Op::Reboot, Op::Cancel] {
+            app.tab = Tab::Console;
+            app.job = Some(running(op));
+            app.interlock_tabs();
+            assert!(app.tab == Tab::Update && app.shown_tab == Tab::Update);
+            app.tab = Tab::Help;
+            app.interlock_tabs();
+            assert!(app.tab == Tab::Help, "Help stays open to it");
+        }
+        app.job = Some(running(Op::Dump));
+        app.tab = Tab::Tuning;
+        app.interlock_tabs();
+        assert!(app.tab == Tab::Tuning && app.shown_tab == Tab::Tuning);
     }
 
     #[test]
